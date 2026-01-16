@@ -373,10 +373,14 @@ class PlotPage(ft.Container):
             self._show_message("⚠️ Dataset not found", is_error=True)
             return
         
-        # Find processed file
-        safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in dataset.name)
-        processed_path = self.data_dir / "datasets" / safe_name / f"{safe_name}_processed.nc"
-        
+        # Find processed file - use file_path from database if available (handles batch imports)
+        if dataset.file_path and Path(dataset.file_path).exists():
+            processed_path = Path(dataset.file_path)
+        else:
+            # Fallback to constructed path for backwards compatibility
+            safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in dataset.name)
+            processed_path = self.data_dir / "datasets" / safe_name / f"{safe_name}_processed.nc"
+
         if not processed_path.exists():
             self._show_message("⚠️ Processed data not found. Download or process the dataset first.", is_error=True)
             return
@@ -519,15 +523,19 @@ class PlotPage(ft.Container):
         if not dataset:
             return
         
-        safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in dataset.name)
-        processed_path = self.data_dir / "datasets" / safe_name / f"{safe_name}_processed.nc"
-        
+        # Find processed file - use file_path from database if available
+        if dataset.file_path and Path(dataset.file_path).exists():
+            processed_path = Path(dataset.file_path)
+        else:
+            safe_name = "".join(c if c.isalnum() or c in "._- " else "_" for c in dataset.name)
+            processed_path = self.data_dir / "datasets" / safe_name / f"{safe_name}_processed.nc"
+
         if not processed_path.exists():
             return
-        
+
         try:
             ds = xr.open_dataset(processed_path)
-            
+
             # Get available hours
             if 'HOUR' in ds.dims:
                 hours = sorted(ds.HOUR.values)

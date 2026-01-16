@@ -43,6 +43,37 @@ def find_n_nearest_cells(lat: float, lon: float, lats_2d: np.ndarray,
     return result
 
 
+def find_cells_within_distance(lat: float, lon: float, lats_2d: np.ndarray,
+                               lons_2d: np.ndarray, max_distance_km: float) -> list[tuple]:
+    """Find all grid cells within a specified distance from a target location.
+    
+    Args:
+        lat, lon: Target coordinates
+        lats_2d, lons_2d: Grid coordinates arrays
+        max_distance_km: Maximum distance in kilometers
+        
+    Returns:
+        List of (row, col, distance) tuples sorted by distance
+    """
+    distances = np.zeros_like(lats_2d)
+    rows, cols = lats_2d.shape
+    for i in range(rows):
+        for j in range(cols):
+            distances[i, j] = haversine(lat, lon, lats_2d[i, j], lons_2d[i, j])
+    
+    # Find all indices where distance <= max_distance_km
+    row_indices, col_indices = np.where(distances <= max_distance_km)
+    
+    result = []
+    for r, c in zip(row_indices, col_indices):
+        result.append((int(r), int(c), float(distances[r, c])))
+        
+    # Sort by distance
+    result.sort(key=lambda x: x[2])
+    
+    return result
+
+
 
 
 
@@ -89,25 +120,38 @@ class DataExporter:
                       dataset: xr.Dataset,
                       dataset_name: str,
                       export_format: str,
-                      num_points: int = 4,
+                      num_points: Optional[int] = None,
+                      distance_km: Optional[float] = None,
                       utc_offset: float = -6.0,
-                      metadata: Optional[dict] = None) -> list[str]:
+                      metadata: Optional[dict] = None,
+                      sites: Optional[dict] = None) -> list[str]:
         """Export dataset in specified format.
 
         Args:
             dataset: xarray.Dataset with LAT, LON coords
             dataset_name: Base name for output files
-            export_format: One of "hourly", "daily"
+            export_format: One of "hourly_multicell", "daily_aggregated", "spatial_average"
+            num_points: Number of nearest cells to include. Defaults depend on format.
+            distance_km: Radius in km to include cells (overrides num_points if set)
             utc_offset: Hours offset from UTC for local time (default -6.0)
             metadata: Optional dictionary of dataset metadata (settings, stats)
+            sites: Dict mapping site code to (lat, lon) tuple. Uses database sites if None.
 
         Returns:
             List of generated file paths
         """
-        if export_format == "hourly":
-            return self._export_hourly(dataset, dataset_name, utc_offset, num_points, metadata)
-        elif export_format == "daily":
-            return self._export_daily(dataset, dataset_name, utc_offset, num_points, metadata)
+        # Use provided sites or fall back to hardcoded SITES constant
+        sites_to_use = sites if sites is not None else SITES
+
+        if export_format == "hourly" or export_format == "hourly_multicell":
+            np = num_points if num_points is not None else 9
+            return self._export_hourly(dataset, dataset_name, utc_offset, np, distance_km, metadata, sites_to_use)
+        elif export_format == "daily" or export_format == "daily_aggregated":
+            np = num_points if num_points is not None else 9
+            return self._export_daily(dataset, dataset_name, utc_offset, np, distance_km, metadata, sites_to_use)
+        elif export_format == "spatial_average":
+            np = num_points if num_points is not None else 4 # Default for spatial average
+            return self._export_spatial_average(dataset, dataset_name, utc_offset, np, distance_km, metadata, sites_to_use)
         else:
             raise ValueError(f"Unknown export format: {export_format}")
 
@@ -151,9 +195,11 @@ class DataExporter:
 
     def _export_hourly(self, dataset: xr.Dataset, dataset_name: str,
                        utc_offset: float, num_points: int = 9,
-                       metadata: Optional[dict] = None) -> list[str]:
+                       distance_km: Optional[float] = None,
+                       metadata: Optional[dict] = None,
+                       sites: Optional[dict] = None) -> list[str]:
         """Export hourly format - separate file per site with N cells.
-        
+
         Columns: UTC_Time, Local_Time (UTC-X.0), Cell1_NO2...CellN_NO2, Cell1_HCHO...CellN_HCHO
         """
         time_dim, time_values = self._get_time_info(dataset)
@@ -164,7 +210,8 @@ class DataExporter:
         lats = dataset['LAT'].values
         lons = dataset['LON'].values
 
-        valid_sites = filter_sites_in_bbox(SITES, dataset)
+        sites_to_use = sites if sites is not None else SITES
+        valid_sites = filter_sites_in_bbox(sites_to_use, dataset)
         if not valid_sites:
             logger.warning("No sites found within dataset bounds")
             return []
@@ -185,8 +232,11 @@ class DataExporter:
         generated_files = []
 
         for site, (t_lat, t_lon) in valid_sites.items():
-            # Find cells based on num_points
-            cells = find_n_nearest_cells(t_lat, t_lon, lats, lons, num_points)
+            # Find cells
+            if distance_km is not None:
+                cells = find_cells_within_distance(t_lat, t_lon, lats, lons, distance_km)
+            else:
+                cells = find_n_nearest_cells(t_lat, t_lon, lats, lons, num_points)
             
             # Build data dictionary
             data = {
@@ -216,14 +266,16 @@ class DataExporter:
                 cell_lon = float(lons[r, c])
                 grid_info.append({
                     'Cell_ID': f'Cell{cell_num}',
-                    'Grid_Lat': cell_lat,
-                    'Grid_Lon': cell_lon,
-                    'Dist_to_Site_km': dist,
+                    'Lat': cell_lat,
+                    'Lon': cell_lon,
+                    'Dist_km': dist,
+                    'Grid_Row': int(r),
+                    'Grid_Col': int(c),
                 })
             df_grid = pd.DataFrame(grid_info)
             
             # Save to Excel with multiple sheets
-            fname = self.output_dir / f"{site}_{dataset_name}_hourly.xlsx"
+            fname = self.output_dir / f"{site}_{dataset_name}_hourly_multicell.xlsx"
             with pd.ExcelWriter(fname, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Hourly_Data', index=False)
                 df_grid.to_excel(writer, sheet_name='Grid_Info', index=False)
@@ -252,9 +304,11 @@ class DataExporter:
 
     def _export_daily(self, dataset: xr.Dataset, dataset_name: str,
                       utc_offset: float, num_points: int = 8,
-                      metadata: Optional[dict] = None) -> list[str]:
+                      distance_km: Optional[float] = None,
+                      metadata: Optional[dict] = None,
+                      sites: Optional[dict] = None) -> list[str]:
         """Export daily format - single file with all sites.
-        
+
         Columns: Date, Site, TMP_NO2_NoFill_Ngridcells, TMP_NO2_NoFill_Ncnt, ...
         Uses hours 08-14 (inclusive) local time.
         Uses configurable num_points (default 8) for cell selection.
@@ -267,7 +321,8 @@ class DataExporter:
         lats = dataset['LAT'].values
         lons = dataset['LON'].values
 
-        valid_sites = filter_sites_in_bbox(SITES, dataset)
+        sites_to_use = sites if sites is not None else SITES
+        valid_sites = filter_sites_in_bbox(sites_to_use, dataset)
         if not valid_sites:
             logger.warning("No sites found within dataset bounds")
             return []
@@ -284,8 +339,11 @@ class DataExporter:
         all_rows = []
 
         for site, (t_lat, t_lon) in valid_sites.items():
-            # Find cells based on num_points
-            cells = find_n_nearest_cells(t_lat, t_lon, lats, lons, num_points)
+            # Find cells
+            if distance_km is not None:
+                cells = find_cells_within_distance(t_lat, t_lon, lats, lons, distance_km)
+            else:
+                cells = find_n_nearest_cells(t_lat, t_lon, lats, lons, num_points)
             
             n_cells = len(cells)
             half_cells = n_cells // 2 if n_cells > 1 else n_cells
@@ -335,27 +393,27 @@ class DataExporter:
                     if no2_cols_n:
                         no2_vals = grp[no2_cols_n].values.flatten()
                         no2_valid = no2_vals[~np.isnan(no2_vals)]
-                        row[f'TMP_NO2_NoFill_{label}gridcells'] = np.mean(no2_valid) if len(no2_valid) > 0 else MISSING_VALUE
-                        row[f'TMP_NO2_NoFill_{label}cnt'] = len(no2_valid)
+                        row[f'NO2_NoFill_{label}_Avg'] = np.mean(no2_valid) if len(no2_valid) > 0 else MISSING_VALUE
+                        row[f'NO2_NoFill_{label}_Cnt'] = len(no2_valid)
                     
                     if hcho_cols_n:
                         hcho_vals = grp[hcho_cols_n].values.flatten()
                         hcho_valid = hcho_vals[~np.isnan(hcho_vals)]
-                        row[f'TMP_HCHO_NoFill_{label}gridcells'] = np.mean(hcho_valid) if len(hcho_valid) > 0 else MISSING_VALUE
-                        row[f'TMP_HCHO_NoFill_{label}cnt'] = len(hcho_valid)
+                        row[f'HCHO_NoFill_{label}_Avg'] = np.mean(hcho_valid) if len(hcho_valid) > 0 else MISSING_VALUE
+                        row[f'HCHO_NoFill_{label}_Cnt'] = len(hcho_valid)
                     
                     # Fill
                     if no2_cols_n:
                         no2_vals_f = grp_filled[no2_cols_n].values.flatten()
                         no2_valid_f = no2_vals_f[~np.isnan(no2_vals_f)]
-                        row[f'TMP_NO2_Fill_{label}gridcells'] = np.mean(no2_valid_f) if len(no2_valid_f) > 0 else MISSING_VALUE
-                        row[f'TMP_NO2_Fill_{label}cnt'] = len(no2_valid_f)
+                        row[f'NO2_Fill_{label}_Avg'] = np.mean(no2_valid_f) if len(no2_valid_f) > 0 else MISSING_VALUE
+                        row[f'NO2_Fill_{label}_Cnt'] = len(no2_valid_f)
                     
                     if hcho_cols_n:
                         hcho_vals_f = grp_filled[hcho_cols_n].values.flatten()
                         hcho_valid_f = hcho_vals_f[~np.isnan(hcho_vals_f)]
-                        row[f'TMP_HCHO_Fill_{label}gridcells'] = np.mean(hcho_valid_f) if len(hcho_valid_f) > 0 else MISSING_VALUE
-                        row[f'TMP_HCHO_Fill_{label}cnt'] = len(hcho_valid_f)
+                        row[f'HCHO_Fill_{label}_Avg'] = np.mean(hcho_valid_f) if len(hcho_valid_f) > 0 else MISSING_VALUE
+                        row[f'HCHO_Fill_{label}_Cnt'] = len(hcho_valid_f)
                 
                 all_rows.append(row)
         
@@ -373,13 +431,11 @@ class DataExporter:
         def col_sort_key(col):
             fill_order = 0 if 'NoFill' in col else 1
             no2_order = 0 if 'NO2' in col else 1
-            cnt_order = 1 if 'cnt' in col else 0
+            cnt_order = 1 if 'Cnt' in col else 0
             # Extract cell count from column name
             import re
-            match = re.search(r'(\d+)gridcells', col)
+            match = re.search(r'_(\d+)_', col)
             cell_count = int(match.group(1)) if match else 0
-            match2 = re.search(r'(\d+)cnt', col)
-            cell_count = int(match2.group(1)) if match2 else cell_count
             return (fill_order, cell_count, no2_order, cnt_order)
         
         other_cols.sort(key=col_sort_key)
@@ -387,7 +443,7 @@ class DataExporter:
         df_final = df_final.sort_values(['Date', 'Site']).reset_index(drop=True)
         
         # Save
-        fname = self.output_dir / f"{dataset_name}_daily.xlsx"
+        fname = self.output_dir / f"{dataset_name}_daily_aggregated.xlsx"
         with pd.ExcelWriter(fname, engine='openpyxl') as writer:
             df_final.to_excel(writer, sheet_name='Daily_Data', index=False)
             if metadata:
@@ -399,7 +455,7 @@ class DataExporter:
                 stats_data.append({'Parameter': 'Total_Site_Days', 'Value': total_rows})
                 
                 # Check missing data in NoFill columns
-                nofill_cols = [c for c in df_final.columns if 'NoFill' in c and 'gridcells' in c]
+                nofill_cols = [c for c in df_final.columns if 'NoFill' in c and 'Avg' in c]
                 for col in nofill_cols:
                     # MISSING_VALUE is -999
                     missing_cnt = (df_final[col] == MISSING_VALUE).sum()
@@ -412,4 +468,134 @@ class DataExporter:
                 meta_final = pd.concat([meta_df, stats_df], ignore_index=True)
                 meta_final.to_excel(writer, sheet_name='Metadata', index=False)
         
+        return [str(fname)]
+
+    def _export_spatial_average(self, dataset: xr.Dataset, dataset_name: str,
+                              utc_offset: float, num_points: int = 9,
+                              distance_km: Optional[float] = None,
+                              metadata: Optional[dict] = None,
+                              sites: Optional[dict] = None) -> list[str]:
+        """Export spatial average format - single file with spatial means per site."""
+        time_dim, time_values = self._get_time_info(dataset)
+        if time_dim is None or 'LAT' not in dataset.coords:
+            logger.warning("Missing required coords/dims")
+            return []
+
+        lats = dataset['LAT'].values
+        lons = dataset['LON'].values
+
+        sites_to_use = sites if sites is not None else SITES
+        valid_sites = filter_sites_in_bbox(sites_to_use, dataset)
+        if not valid_sites:
+            logger.warning("No sites found within dataset bounds")
+            return []
+
+        # Time handling
+        if isinstance(time_values, pd.DatetimeIndex):
+            utc_times = time_values
+            local_times = utc_times + pd.Timedelta(hours=utc_offset)
+        else:
+            hours = time_values
+            # Create dummy dates for hours
+            base_date = pd.Timestamp.now().normalize()
+            utc_times = [base_date + pd.Timedelta(hours=int(h)) for h in hours]
+            local_times = [t + pd.Timedelta(hours=utc_offset) for t in utc_times]
+            utc_times = pd.DatetimeIndex(utc_times)
+            local_times = pd.DatetimeIndex(local_times)
+
+        # Prepare DataFrames
+        df_raw = pd.DataFrame({
+            'UTC': utc_times,
+            'Local': local_times,
+            'Date': local_times.date,
+            'Hour': local_times.hour
+        })
+        
+        grid_cells_info = []
+        site_stats = []
+
+        for site, (t_lat, t_lon) in valid_sites.items():
+             # Find cells
+            if distance_km is not None:
+                cells = find_cells_within_distance(t_lat, t_lon, lats, lons, distance_km)
+            else:
+                cells = find_n_nearest_cells(t_lat, t_lon, lats, lons, num_points)
+            
+            site_stats.append({'Site': site, 'Points': len(cells)})
+            
+            # Record grid cells info
+            for r, c, dist in cells:
+                grid_cells_info.append({
+                    'Site': site,
+                    'Grid_Lat': float(lats[r, c]),
+                    'Grid_Lon': float(lons[r, c]),
+                    'Dist (km)': dist
+                })
+
+            # Calculate spatial means
+            no2_means = []
+            hcho_means = []
+            
+            # Extract data for all timesteps
+            for t_idx in range(len(utc_times)):
+                # Get values for all cells at this timestep
+                no2_vals = []
+                hcho_vals = []
+                
+                for r, c, _ in cells:
+                    if 'NO2_TropVCD' in dataset:
+                        # Handle TSTEP vs HOUR dimension
+                        if time_dim == 'TSTEP':
+                            val = dataset['NO2_TropVCD'].isel(TSTEP=t_idx, ROW=r, COL=c).item()
+                        else:
+                             val = dataset['NO2_TropVCD'].isel(HOUR=t_idx, ROW=r, COL=c).item()
+                        no2_vals.append(val)
+                    
+                    if 'HCHO_TotVCD' in dataset:
+                        if time_dim == 'TSTEP':
+                            val = dataset['HCHO_TotVCD'].isel(TSTEP=t_idx, ROW=r, COL=c).item()
+                        else:
+                            val = dataset['HCHO_TotVCD'].isel(HOUR=t_idx, ROW=r, COL=c).item()
+                        hcho_vals.append(val)
+                
+                # Average (ignoring NaNs)
+                # Suppress RuntimeWarning for mean of empty slice
+                with np.errstate(all='ignore'):
+                    no2_mean = np.nanmean(no2_vals) if no2_vals else np.nan
+                    hcho_mean = np.nanmean(hcho_vals) if hcho_vals else np.nan
+                
+                no2_means.append(no2_mean)
+                hcho_means.append(hcho_mean)
+            
+            # Add to DataFrame
+            df_raw[f'{site}_NO2'] = no2_means
+            df_raw[f'{site}_HCHO'] = hcho_means
+            
+            # Calculate FNR
+            # Avoid division by zero/small numbers
+            no2_arr = np.array(no2_means)
+            hcho_arr = np.array(hcho_means)
+            fnr = np.where(no2_arr > 1e-12, hcho_arr / no2_arr, np.nan)
+            df_raw[f'{site}_FNR'] = fnr
+
+        # Create Filled_Data (gap filling)
+        df_filled = df_raw.copy()
+        value_cols = [c for c in df_filled.columns if '_NO2' in c or '_HCHO' in c or '_FNR' in c]
+        
+        # Helper to fill by hour
+        for col in value_cols:
+            means = df_filled.groupby('Hour')[col].transform('mean')
+            df_filled[col] = df_filled[col].fillna(means)
+
+        # Save
+        fname = self.output_dir / f"FNR_{dataset_name}_spatial_average.xlsx"
+        with pd.ExcelWriter(fname, engine='openpyxl') as writer:
+            df_raw.to_excel(writer, sheet_name='Raw_Data', index=False)
+            df_filled.to_excel(writer, sheet_name='Filled_Data', index=False)
+            pd.DataFrame(site_stats).to_excel(writer, sheet_name='Summary', index=False)
+            pd.DataFrame(grid_cells_info).to_excel(writer, sheet_name='Grid_Cells', index=False)
+            
+            if metadata:
+                self._create_metadata_df(metadata).to_excel(writer, sheet_name='Metadata', index=False)
+                
         return [str(fname)]

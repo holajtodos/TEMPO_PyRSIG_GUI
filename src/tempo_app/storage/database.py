@@ -85,6 +85,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS datasets (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    batch_job_id TEXT,
                     created_at TIMESTAMP NOT NULL,
                     bbox_west REAL NOT NULL,
                     bbox_south REAL NOT NULL,
@@ -178,15 +179,10 @@ class Database:
                     site_name TEXT NOT NULL,
                     latitude REAL NOT NULL,
                     longitude REAL NOT NULL,
-                    radius_km REAL NOT NULL,
                     bbox_west REAL NOT NULL,
                     bbox_south REAL NOT NULL,
                     bbox_east REAL NOT NULL,
                     bbox_north REAL NOT NULL,
-                    custom_date_start DATE,
-                    custom_date_end DATE,
-                    custom_max_cloud REAL,
-                    custom_max_sza REAL,
                     status TEXT NOT NULL DEFAULT 'pending',
                     dataset_id TEXT REFERENCES datasets(id),
                     error_message TEXT,
@@ -203,7 +199,19 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_batch_sites_job ON batch_sites(batch_job_id);
                 CREATE INDEX IF NOT EXISTS idx_batch_sites_status ON batch_sites(status);
             """)
-    
+
+            # Run migrations for existing databases
+            self._run_migrations(conn)
+
+    def _run_migrations(self, conn):
+        """Run schema migrations for existing databases."""
+        # Check if batch_job_id column exists in datasets table
+        cursor = conn.execute("PRAGMA table_info(datasets)")
+        columns = [row[1] for row in cursor.fetchall()]
+
+        if "batch_job_id" not in columns:
+            conn.execute("ALTER TABLE datasets ADD COLUMN batch_job_id TEXT")
+
     # ==========================================================================
     # Dataset Operations
     # ==========================================================================
@@ -216,13 +224,13 @@ class Database:
         with self._get_connection() as conn:
             conn.execute("""
                 INSERT INTO datasets (
-                    id, name, created_at, bbox_west, bbox_south, bbox_east, bbox_north,
+                    id, name, batch_job_id, created_at, bbox_west, bbox_south, bbox_east, bbox_north,
                     date_start, date_end, day_filter, hour_filter, max_cloud, max_sza,
                     status, file_path, file_hash, file_size_mb, last_accessed,
                     granule_count, granules_downloaded
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                dataset.id, dataset.name, dataset.created_at,
+                dataset.id, dataset.name, dataset.batch_job_id, dataset.created_at,
                 dataset.bbox.west, dataset.bbox.south, dataset.bbox.east, dataset.bbox.north,
                 dataset.date_start, dataset.date_end,
                 json.dumps(dataset.day_filter), json.dumps(dataset.hour_filter),
@@ -311,7 +319,9 @@ class Database:
                 print(f"Error deleting folder {dataset_dir}: {e}")
 
         # Delete from database (cascade will handle granules/exports)
+        # But we must manually unlink batch_sites which don't cascade
         with self._get_connection() as conn:
+            conn.execute("UPDATE batch_sites SET dataset_id = NULL, status = 'pending' WHERE dataset_id = ?", (dataset_id,))
             conn.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
     
     def touch_dataset(self, dataset_id: str) -> None:
@@ -327,6 +337,7 @@ class Database:
         return Dataset(
             id=row["id"],
             name=row["name"],
+            batch_job_id=row["batch_job_id"] if "batch_job_id" in row.keys() else None,
             created_at=row["created_at"] if isinstance(row["created_at"], datetime) 
                        else datetime.fromisoformat(row["created_at"]),
             bbox=BoundingBox(
@@ -549,7 +560,7 @@ class Database:
     
     def get_sites_as_dict(self,  bbox: BoundingBox = None) -> dict[str, tuple[float, float]]:
         """Get sites as dict format for plotter compatibility.
-        
+
         Returns:
             Dict mapping site code to (latitude, longitude) tuple
         """
@@ -558,7 +569,15 @@ class Database:
         else:
             sites = self.get_all_sites()
         return {s.code: s.to_tuple() for s in sites}
-    
+
+    def get_site_by_code(self, code: str) -> Optional[Site]:
+        """Get a site by its code."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM sites WHERE code = ?", (code,)
+            ).fetchone()
+            return self._row_to_site(row) if row else None
+
     def delete_site(self, site_id: int) -> None:
         """Delete a site by ID."""
         with self._get_connection() as conn:
@@ -710,6 +729,68 @@ class Database:
         with self._get_connection() as conn:
             conn.execute("DELETE FROM batch_jobs WHERE id = ?", (job_id,))
 
+    def delete_batch_job_full(self, job_id: str) -> None:
+        """Delete a batch job, all associated datasets, files, and sites."""
+        import shutil
+        from pathlib import Path
+
+        # Get the batch job to find the folder name
+        job = self.get_batch_job(job_id)
+        if not job:
+            return
+
+        # Get all datasets in this batch
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM datasets WHERE batch_job_id = ?", (job_id,)
+            ).fetchall()
+
+        dataset_ids = [row["id"] for row in rows]
+
+        # Delete dataset files and folders
+        deleted_folders = set()
+        for row in rows:
+            file_path = row["file_path"]
+            if file_path:
+                fp = Path(file_path)
+                # Delete the parent folder (site folder)
+                if fp.parent.exists() and fp.parent not in deleted_folders:
+                    try:
+                        shutil.rmtree(fp.parent)
+                        deleted_folders.add(fp.parent)
+                    except Exception as e:
+                        print(f"Error deleting folder {fp.parent}: {e}")
+
+        # Try to delete the job folder (parent of site folders)
+        if deleted_folders:
+            job_folder = next(iter(deleted_folders)).parent
+            if job_folder.exists() and not any(job_folder.iterdir()):
+                try:
+                    job_folder.rmdir()
+                except Exception:
+                    pass
+
+        # Delete from database - use raw connection to disable FK checks
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            cursor = conn.cursor()
+            # Delete granules for each dataset
+            for ds_id in dataset_ids:
+                cursor.execute("DELETE FROM granules WHERE dataset_id = ?", (ds_id,))
+            # Delete exports for each dataset
+            for ds_id in dataset_ids:
+                cursor.execute("DELETE FROM exports WHERE dataset_id = ?", (ds_id,))
+            # Delete batch sites
+            cursor.execute("DELETE FROM batch_sites WHERE batch_job_id = ?", (job_id,))
+            # Delete datasets
+            cursor.execute("DELETE FROM datasets WHERE batch_job_id = ?", (job_id,))
+            # Delete the batch job
+            cursor.execute("DELETE FROM batch_jobs WHERE id = ?", (job_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
     def _row_to_batch_job(self, row: sqlite3.Row) -> BatchJob:
         """Convert a database row to a BatchJob object."""
         return BatchJob(
@@ -745,14 +826,12 @@ class Database:
                 INSERT INTO batch_sites (
                     batch_job_id, site_name, latitude, longitude, radius_km,
                     bbox_west, bbox_south, bbox_east, bbox_north,
-                    custom_date_start, custom_date_end, custom_max_cloud, custom_max_sza,
                     status, dataset_id, error_message, started_at, completed_at, sequence_number
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 (
                     s.batch_job_id, s.site_name, s.latitude, s.longitude, s.radius_km,
                     s.bbox_west, s.bbox_south, s.bbox_east, s.bbox_north,
-                    s.custom_date_start, s.custom_date_end, s.custom_max_cloud, s.custom_max_sza,
                     s.status.value, s.dataset_id, s.error_message, s.started_at, s.completed_at,
                     s.sequence_number
                 )
@@ -818,10 +897,6 @@ class Database:
             bbox_south=row["bbox_south"],
             bbox_east=row["bbox_east"],
             bbox_north=row["bbox_north"],
-            custom_date_start=_parse_date(row["custom_date_start"]) if row["custom_date_start"] else None,
-            custom_date_end=_parse_date(row["custom_date_end"]) if row["custom_date_end"] else None,
-            custom_max_cloud=row["custom_max_cloud"],
-            custom_max_sza=row["custom_max_sza"],
             status=BatchSiteStatus(row["status"]),
             dataset_id=row["dataset_id"],
             error_message=row["error_message"],

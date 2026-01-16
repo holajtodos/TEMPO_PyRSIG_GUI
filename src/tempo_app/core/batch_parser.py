@@ -20,11 +20,6 @@ class ParsedSite:
     site_name: str
     latitude: float
     longitude: float
-    radius_km: Optional[float] = None  # None = use default
-    custom_date_start: Optional[str] = None
-    custom_date_end: Optional[str] = None
-    custom_max_cloud: Optional[float] = None
-    custom_max_sza: Optional[float] = None
     error: Optional[str] = None  # Validation error for this row
 
 
@@ -67,11 +62,6 @@ COLUMN_ALIASES = {
     "name": ["name", "site_name", "site", "location", "id", "site_id"],
     "latitude": ["latitude", "lat", "y", "lat_dd"],
     "longitude": ["longitude", "lon", "long", "x", "lng", "lon_dd"],
-    "radius_km": ["radius_km", "radius", "buffer_km", "buffer"],
-    "date_start": ["date_start", "start_date", "begin_date", "from_date"],
-    "date_end": ["date_end", "end_date", "finish_date", "to_date"],
-    "max_cloud": ["max_cloud", "cloud_fraction", "cloud", "cf"],
-    "max_sza": ["max_sza", "sza", "solar_zenith", "zenith"],
 }
 
 
@@ -161,11 +151,6 @@ def parse_import_file(file_path: Path, default_radius_km: float = 10.0) -> Parse
         return result
 
     # Find optional columns
-    radius_col = _find_column(df, COLUMN_ALIASES["radius_km"])
-    date_start_col = _find_column(df, COLUMN_ALIASES["date_start"])
-    date_end_col = _find_column(df, COLUMN_ALIASES["date_end"])
-    cloud_col = _find_column(df, COLUMN_ALIASES["max_cloud"])
-    sza_col = _find_column(df, COLUMN_ALIASES["max_sza"])
 
     # Parse each row
     for idx, row in df.iterrows():
@@ -208,47 +193,6 @@ def parse_import_file(file_path: Path, default_radius_km: float = 10.0) -> Parse
             site.error = err_msg
             result.sites.append(site)
             continue
-
-        # Parse optional radius
-        if radius_col and pd.notna(row[radius_col]):
-            try:
-                radius = float(row[radius_col])
-                if radius <= 0:
-                    result.warnings.append(f"Row {row_num}: Radius must be positive, using default {default_radius_km} km")
-                else:
-                    site.radius_km = radius
-            except (ValueError, TypeError):
-                result.warnings.append(f"Row {row_num}: Invalid radius '{row[radius_col]}', using default")
-
-        # Parse optional date_start
-        if date_start_col and pd.notna(row[date_start_col]):
-            site.custom_date_start = _parse_date_value(row[date_start_col])
-
-        # Parse optional date_end
-        if date_end_col and pd.notna(row[date_end_col]):
-            site.custom_date_end = _parse_date_value(row[date_end_col])
-
-        # Parse optional max_cloud
-        if cloud_col and pd.notna(row[cloud_col]):
-            try:
-                cloud = float(row[cloud_col])
-                if 0.0 <= cloud <= 1.0:
-                    site.custom_max_cloud = cloud
-                else:
-                    result.warnings.append(f"Row {row_num}: max_cloud must be 0.0-1.0, using default")
-            except (ValueError, TypeError):
-                result.warnings.append(f"Row {row_num}: Invalid max_cloud, using default")
-
-        # Parse optional max_sza
-        if sza_col and pd.notna(row[sza_col]):
-            try:
-                sza = float(row[sza_col])
-                if 30 <= sza <= 90:
-                    site.custom_max_sza = sza
-                else:
-                    result.warnings.append(f"Row {row_num}: max_sza must be 30-90, using default")
-            except (ValueError, TypeError):
-                result.warnings.append(f"Row {row_num}: Invalid max_sza, using default")
 
         result.sites.append(site)
 

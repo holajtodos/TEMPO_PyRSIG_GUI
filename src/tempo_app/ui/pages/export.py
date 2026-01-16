@@ -495,6 +495,9 @@ class ExportPage(ft.Container):
                 'export_params_utc_offset': utc_offset,
             }
 
+            # Get sites from database (includes batch-imported sites)
+            sites = self.db.get_sites_as_dict(self._selected_dataset.bbox)
+
             generated_files = self.exporter.export_dataset(
                 dataset=ds,
                 dataset_name=self._selected_dataset.name,
@@ -502,6 +505,7 @@ class ExportPage(ft.Container):
                 num_points=num_points,
                 utc_offset=utc_offset,
                 metadata=metadata,
+                sites=sites,
             )
 
             # Close dataset

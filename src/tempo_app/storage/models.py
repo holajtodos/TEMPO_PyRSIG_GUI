@@ -84,6 +84,7 @@ class Dataset:
     
     # Download status
     status: DatasetStatus = DatasetStatus.PENDING
+    batch_job_id: Optional[str] = None # ID of batch job if part of one
     file_path: Optional[str] = None  # Path to combined .nc file
     file_hash: Optional[str] = None  # SHA256 of file content
     file_size_mb: float = 0.0
@@ -259,19 +260,13 @@ class BatchSite:
     site_name: str = ""              # Site identifier from Excel
     latitude: float = 0.0
     longitude: float = 0.0
-    radius_km: float = 10.0          # Radius for bbox calculation
+    radius_km: float = 10.0          # Radius used (from job default)
 
     # Computed bounding box
     bbox_west: float = 0.0
     bbox_south: float = 0.0
     bbox_east: float = 0.0
     bbox_north: float = 0.0
-
-    # Per-site overrides (None = use batch default)
-    custom_date_start: Optional[date] = None
-    custom_date_end: Optional[date] = None
-    custom_max_cloud: Optional[float] = None
-    custom_max_sza: Optional[float] = None
 
     # Processing status
     status: BatchSiteStatus = BatchSiteStatus.PENDING

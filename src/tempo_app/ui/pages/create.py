@@ -12,6 +12,10 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 import asyncio
+import tempfile
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend
+import matplotlib.pyplot as plt
 
 from ..theme import Colors, Spacing
 from ..components.widgets import (
@@ -199,11 +203,13 @@ class CreatePage(ft.Container):
         self.config = config
         self.status = get_status_manager()
         self._is_downloading = False
+        self._current_download_id: Optional[str] = None  # For global DownloadManager
         
         # Form state
         self._selected_preset: Optional[str] = None
         self._extend_mode = False  # True = extending existing dataset
         self._extend_dataset_id: Optional[str] = None  # ID of dataset being extended
+
         
         # Build the page
         self._build()
@@ -217,6 +223,8 @@ class CreatePage(ft.Container):
             self.page.overlay.append(self._end_picker)
         # Load datasets async
         self.page.run_task(self._load_datasets_async)
+        # Generate initial map preview
+        self.page.run_task(self._update_map_preview_async)
 
     async def _load_datasets_async(self):
         """Load datasets without blocking UI."""
@@ -457,6 +465,7 @@ class CreatePage(ft.Container):
             bgcolor=Colors.SURFACE_VARIANT,
             text_style=ft.TextStyle(color=Colors.ON_SURFACE),
         )
+        self._hour_start.on_change = self._on_hour_change
         
         self._hour_end = ft.Dropdown(
             options=[ft.DropdownOption(str(h), f"{h:02d}:00 UTC") for h in range(24)],
@@ -467,6 +476,7 @@ class CreatePage(ft.Container):
             bgcolor=Colors.SURFACE_VARIANT,
             text_style=ft.TextStyle(color=Colors.ON_SURFACE),
         )
+        self._hour_end.on_change = self._on_hour_change
         
         # UTC timezone warning
         utc_warning = ft.Container(
@@ -668,14 +678,97 @@ class CreatePage(ft.Container):
             padding=16,
         )
         
+
+        
         # =====================================================================
-        # Page Layout - Two Column
+        # Map Preview Section (Right Panel)
         # =====================================================================
+        # Initialize map controls
+        # Use 1x1 transparent pixel to avoid "valid src must be specified" error
+        self._map_image_control = ft.Image(
+            src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+            fit="contain", 
+            gapless_playback=True
+        )
+        
+        self._map_progress = ft.ProgressBar(width=None, visible=False, color=Colors.PRIMARY, height=2)
+        
+        self._map_preview = ft.Container(
+            content=ft.Column([
+                ft.Icon(ft.Icons.MAP_OUTLINED, size=64, color=Colors.ON_SURFACE_VARIANT),
+                ft.Text("Region Preview", size=16, weight=ft.FontWeight.W_500, color=Colors.ON_SURFACE),
+                ft.Text("Select a region to see it on the map", size=12, color=Colors.ON_SURFACE_VARIANT),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER),
+            bgcolor=Colors.SURFACE_VARIANT,
+            border_radius=12,
+            alignment=ft.Alignment(0, 0),
+            expand=True,
+        )
+        
+        # Coordinate display for map preview
+        self._map_coord_label = ft.Text(
+            "W: -119.68°  S: 32.23°  E: -116.38°  N: 35.73°",
+            size=12,
+            color=Colors.ON_SURFACE_VARIANT,
+            text_align=ft.TextAlign.CENTER,
+        )
+        
+        map_preview_panel = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("Region Preview", size=16, weight=ft.FontWeight.W_600, color=Colors.ON_SURFACE),
+                    ft.Container(expand=True),
+                    ft.IconButton(
+                        icon=ft.Icons.SAVE_ALT,
+                        tooltip="Save Image",
+                        on_click=self._on_save_map_click,
+                    ),
+                    ft.IconButton(
+                        icon=ft.Icons.REFRESH,
+                        tooltip="Refresh map preview",
+                        on_click=self._on_refresh_map_click,
+                    ),
+                ], spacing=8),
+                ft.Container(height=8),
+
+                self._map_progress,
+                # Map Preview (Static)
+                ft.Container(
+                    content=self._map_image_control,
+                    bgcolor=Colors.SURFACE_VARIANT,
+                    border_radius=12,
+                    alignment=ft.Alignment(0, 0),
+                    clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                    expand=True,
+                ),
+                
+                ft.Container(height=8),
+                self._map_coord_label,
+            ], expand=True),
+            padding=16,
+            expand=True,
+        )
+        
+        # =====================================================================
+        # Page Layout - Left (Form 40%) / Right (Map 60%)
+        # =====================================================================
+        
+        # Back button for header
+        back_btn = ft.TextButton(
+            content=ft.Row([
+                ft.Icon(ft.Icons.ARROW_BACK, size=18),
+                ft.Text("Back to Library"),
+            ], spacing=6, tight=True),
+            on_click=self._on_back_click,
+        )
+        
         left_column = ft.Column(
             controls=[
-                # Header
+                # Header with back button
                 ft.Row([
-                    ft.Text("📊 Create Dataset", size=28, weight=ft.FontWeight.BOLD, color=Colors.ON_SURFACE),
+                    back_btn,
+                    ft.Container(width=16),
+                    ft.Text("📊 New Dataset", size=24, weight=ft.FontWeight.BOLD, color=Colors.ON_SURFACE),
                     HelpTooltip(
                         "Create a new dataset by downloading TEMPO satellite data.\n\n"
                         "TEMPO (Tropospheric Emissions: Monitoring of Pollution) is a NASA "
@@ -686,7 +779,7 @@ class CreatePage(ft.Container):
                         "• HCHO (Formaldehyde) - from vegetation, fires, industry\n"
                         "• FNR (HCHO/NO₂ ratio) - indicates VOC vs NOx sensitivity"
                     ),
-                ], spacing=8),
+                ], spacing=8, vertical_alignment=ft.CrossAxisAlignment.CENTER),
                 
                 ft.Divider(height=20, color=Colors.DIVIDER),
                 
@@ -699,6 +792,8 @@ class CreatePage(ft.Container):
                 ft.Container(height=8),
                 filter_section,
                 ft.Container(height=16),
+                
+
                 
                 # Download controls
                 ft.Row([
@@ -715,17 +810,20 @@ class CreatePage(ft.Container):
         
         right_column = ft.Column(
             controls=[
-                self._worker_progress,  # Download progress above activity log
+                map_preview_panel,
+                ft.Container(height=16),
+                self._worker_progress,  # Download progress
                 self._status_log,
             ],
             expand=True,
         )
         
-        # Main content
+        # Main content - 40/60 split
         self.content = ft.Row(
             controls=[
                 ft.Container(content=left_column, expand=2, padding=ft.padding.only(right=16)),
-                ft.Container(content=right_column, expand=1),
+                ft.VerticalDivider(width=1, color=Colors.DIVIDER),
+                ft.Container(content=right_column, expand=3),
             ],
             expand=True,
             spacing=0,
@@ -734,8 +832,233 @@ class CreatePage(ft.Container):
         self.expand = True
         self.padding = Spacing.PAGE_HORIZONTAL
         
-        # Initial preview update
+        # Initial preview/estimation update
         self._update_preview()
+        self._update_map_coord_label()
+    
+    def _get_shell(self):
+        """Get the AppShell from the page."""
+        if self.page and self.page.controls:
+            return self.page.controls[0]
+        return None
+    
+    def _get_download_manager(self):
+        """Get the global DownloadManager from the shell."""
+        shell = self._get_shell()
+        if shell and hasattr(shell, 'download_manager'):
+            return shell.download_manager
+        return None
+    
+    def _on_back_click(self, e):
+        """Navigate back to Library."""
+        shell = self._get_shell()
+        if shell and hasattr(shell, 'navigate_to'):
+            shell.navigate_to("/library")
+    
+    def _on_refresh_map_click(self, e):
+        """Manually refresh the map preview."""
+        self._update_map_coord_label()
+        if self.page:
+            self.page.run_task(self._update_map_preview_async)
+    
+    def _update_map_coord_label(self):
+        """Update the map coordinate label based on current bbox."""
+        try:
+            if hasattr(self, '_map_coord_label'):
+                self._map_coord_label.value = f"W: {self._bbox[0]:.2f}°  S: {self._bbox[1]:.2f}°  E: {self._bbox[2]:.2f}°  N: {self._bbox[3]:.2f}°"
+        except Exception:
+            pass
+
+    
+    def _generate_map_preview(self, bbox=None, detailed=False):
+        """Generate a lightweight map preview showing the bbox region using cartopy."""
+        try:
+            import cartopy.crs as ccrs
+            import cartopy.feature as cfeature
+            import cartopy.io.shapereader as shapereader
+            import time
+            
+            # Use passed bbox or current state
+            west, south, east, north = bbox if bbox else self._bbox
+            
+            # Create figure with cartopy projection - higher res for dynamic sizing
+            fig = plt.figure(figsize=(10, 8), dpi=150)
+            ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+            
+            # Set extent with some padding
+            pad_lon = (east - west) * 0.15
+            pad_lat = (north - south) * 0.15
+            ax.set_extent([
+                west - pad_lon, east + pad_lon,
+                south - pad_lat, north + pad_lat
+            ], crs=ccrs.PlateCarree())
+            
+            # Add geographic features
+            ax.add_feature(cfeature.LAND, facecolor='#f8f9fa')
+            ax.add_feature(cfeature.OCEAN, facecolor='#e3f2fd')
+            ax.add_feature(cfeature.COASTLINE, linewidth=0.8, edgecolor='#37474f')
+            ax.add_feature(cfeature.BORDERS, linewidth=1.0, edgecolor='#263238', linestyle='-')
+            ax.add_feature(cfeature.STATES, linewidth=0.8, edgecolor='#546e7a', linestyle='-')
+            
+            # Add detailed highways (Natural Earth roads) if requested
+            if detailed:
+                try:
+                    roads_10m = shapereader.natural_earth(
+                        resolution='10m',
+                        category='cultural',
+                        name='roads'
+                    )
+                    reader = shapereader.Reader(roads_10m)
+                    
+                    # Filter and plot roads
+                    for record in reader.records():
+                        road_type = record.attributes.get('type', '')
+                        
+                        # Filter for map detail
+                        # Interstate: Black, thick, top priority
+                        # Major/Beltway: Dark Grey, medium
+                        # Others: Light Grey, thin
+                        
+                        linewidth = 0.5
+                        color = '#9e9e9e'
+                        zorder = 3
+                        
+                        if road_type == 'Interstate':
+                            linewidth = 1.2
+                            color = '#000000' # Dark Black
+                            zorder = 5
+                        elif road_type in ['Major Highway', 'Beltway']:
+                            linewidth = 1.0
+                            color = '#424242' # Dark Grey
+                            zorder = 4
+                        else:
+                            # Keep little roads but grey
+                            linewidth = 0.6
+                            color = '#757575' # Grey
+                            zorder = 3
+                            
+                        # Check intersection with view bounds (optimization)
+                        geom = record.geometry
+                        bounds = geom.bounds
+                        # Simple bounds check with padding
+                        if (bounds[2] < west - pad_lon or bounds[0] > east + pad_lon or 
+                            bounds[3] < south - pad_lat or bounds[1] > north + pad_lat):
+                            continue
+                            
+                        ax.add_geometries(
+                            [geom],
+                            ccrs.PlateCarree(),
+                            facecolor='none',
+                            edgecolor=color,
+                            linewidth=linewidth,
+                            alpha=0.7,
+                            zorder=zorder
+                        )
+                except Exception as e:
+                    print(f"Road overlay warning: {e}")
+                    
+                except Exception as e:
+                    print(f"Road overlay warning: {e}")
+                    
+                # Add top 5 major cities
+                try:
+                    cities_shp = shapereader.natural_earth(
+                        resolution='10m',
+                        category='cultural',
+                        name='populated_places'
+                    )
+                    reader = shapereader.Reader(cities_shp)
+                    
+                    valid_cities = []
+                    
+                    for record in reader.records():
+                        # Get attributes
+                        name = record.attributes.get('NAME', '')
+                        pop_max = record.attributes.get('POP_MAX', 0)
+                        
+                        # Use lower threshold to gather candidates, then sort
+                        if pop_max < 50000:
+                            continue
+                            
+                        geom = record.geometry
+                        x = geom.x
+                        y = geom.y
+                        
+                        # Check bounds (strict to view)
+                        if (x < west - pad_lon or x > east + pad_lon or 
+                            y < south - pad_lat or y > north + pad_lat):
+                            continue
+                            
+                        valid_cities.append((pop_max, name, x, y))
+                    
+                    # Sort by population descending and take top 5
+                    valid_cities.sort(key=lambda x: x[0], reverse=True)
+                    top_cities = valid_cities[:5]
+                    
+                    for pop, name, x, y in top_cities:
+                        # Plot marker
+                        ax.plot(x, y, marker='o', color='black', markersize=4, 
+                               transform=ccrs.PlateCarree(), zorder=10)
+                        
+                        # Use simple right alignment for all labels as requested
+                        txt_x = x + 0.05
+                        txt_y = y + 0.02
+                        ha = 'left'
+                        
+                        # Plot label with halo
+                        text = ax.text(txt_x, txt_y, name,
+                                     fontsize=9, fontweight='bold', color='#212121',
+                                     ha=ha, va='bottom',
+                                     transform=ccrs.PlateCarree(), zorder=11)
+                                     
+                        import matplotlib.patheffects as path_effects
+                        text.set_path_effects([
+                            path_effects.withStroke(linewidth=2, foreground='white', alpha=0.8)
+                        ])
+                        
+                except Exception as e:
+                    print(f"City overlay warning: {e}")
+            
+            # Draw the bbox rectangle
+            from matplotlib.patches import Rectangle
+            rect = Rectangle(
+                (west, south), east - west, north - south,
+                linewidth=2, edgecolor='#6200EE', facecolor='#6200EE',
+                alpha=0.2, transform=ccrs.PlateCarree(),
+                zorder=6
+            )
+            ax.add_patch(rect)
+            
+            # Draw bbox outline
+            ax.plot([west, east, east, west, west],
+                    [south, south, north, north, south],
+                    color='#6200EE', linewidth=2, transform=ccrs.PlateCarree(), zorder=6)
+            
+            # Add gridlines
+            gl = ax.gridlines(draw_labels=True, linewidth=0.3, color='gray', alpha=0.5, zorder=7)
+            gl.top_labels = False
+            gl.right_labels = False
+            gl.xlabel_style = {'size': 8}
+            gl.ylabel_style = {'size': 8}
+            
+            plt.tight_layout()
+            
+            # Save to temp file with unique name to bust cache
+            temp_dir = Path(tempfile.gettempdir()) / "tempo_app"
+            temp_dir.mkdir(exist_ok=True)
+            timestamp = int(time.time() * 1000)
+            preview_path = temp_dir / f"region_preview_{timestamp}.png"
+            fig.savefig(preview_path, dpi=100, bbox_inches='tight', 
+                       facecolor='white', edgecolor='none')
+            plt.close(fig)
+            
+            return str(preview_path)
+            
+        except Exception as e:
+            # Return error message as string
+            import traceback
+            traceback.print_exc()
+            return f"Error: {e}"
     
     def _on_mode_change(self, e):
         """Handle mode toggle change."""
@@ -847,7 +1170,88 @@ class CreatePage(ft.Container):
             self._coord_display.visible = True
         
         self._update_preview()
+        self._update_map_coord_label()
+        # Generate map preview asynchronously to avoid blocking UI
+        if self.page:
+            self.page.run_task(self._update_map_preview_async)
         self.update()
+    
+    
+    def _on_save_map_click(self, e):
+        """Save the current map preview to Downloads."""
+        if not self._map_image_control.src:
+             self._status_log.add_warning("No map to save")
+             return
+             
+        try:
+            import shutil
+            import time
+            
+            src_path = Path(self._map_image_control.src)
+            if not src_path.exists():
+                self._status_log.add_error("Map file source not found")
+                return
+                
+            # Get Downloads folder safely
+            downloads_path = Path.home() / "Downloads"
+            if not downloads_path.exists():
+                 # Fallback to home
+                 downloads_path = Path.home()
+            
+            timestamp = int(time.time())
+            filename = f"TEMPO_Map_Preview_{timestamp}.png"
+            dest_path = downloads_path / filename
+            
+            shutil.copy2(src_path, dest_path)
+            
+            self._status_log.add_success(f"Map saved to: {dest_path}")
+            
+        except Exception as e:
+            self._status_log.add_error(f"Failed to save map: {e}")
+
+    async def _update_map_preview_async(self):
+
+        """Generate map preview asynchronously with two-stage loading."""
+        # Capture current bbox to avoid race conditions
+        current_bbox = list(self._bbox)
+        
+        # Show progress
+        if hasattr(self, '_map_progress'):
+            self._map_progress.visible = True
+            self.update()
+        
+        # Stage 1: Generate base map immediately (fast)
+        path_base = await asyncio.to_thread(
+            self._generate_map_preview, 
+            bbox=current_bbox, 
+            detailed=False
+        )
+        
+        # Update UI with base map - Use image control directly
+        if path_base and not path_base.startswith("Error"):
+             self._map_image_control.src = path_base
+             self._map_image_control.update()
+        
+        # Stage 2: Generate detailed map with roads (slower)
+        path_detailed = await asyncio.to_thread(
+            self._generate_map_preview, 
+            bbox=current_bbox, 
+            detailed=True
+        )
+        
+        # Update UI with detailed map
+        if path_detailed and not path_detailed.startswith("Error"):
+             self._map_image_control.src = path_detailed
+             self._map_image_control.update()
+        elif path_detailed:
+             # Show error log
+             print(f"Map Error: {path_detailed}")
+             self._status_log.add_error(f"Map Error: {path_detailed}")
+            
+        # Hide progress
+        if hasattr(self, '_map_progress'):
+            self._map_progress.visible = False
+            self.update()
     
     def _on_cloud_change(self, e):
         """Update cloud fraction label."""
@@ -898,6 +1302,7 @@ class CreatePage(ft.Container):
             self._start_date = e.control.value
             self._date_start_label.value = self._start_date.strftime("%b %d, %Y")
             self._update_preview()
+
             self.update()
     
     def _on_end_date_change(self, e):
@@ -906,13 +1311,21 @@ class CreatePage(ft.Container):
             self._end_date = e.control.value
             self._date_end_label.value = self._end_date.strftime("%b %d, %Y")
             self._update_preview()
+
             self.update()
     
     def _on_day_change(self, days: list[int]):
         """Handle day selection change."""
         self._update_preview()
+
         if hasattr(self, 'update'):
             self.update()
+    
+    def _on_hour_change(self, e):
+        """Handle hour dropdown change."""
+        self._update_preview()
+
+        self.update()
 
     def _update_preview(self):
         """Update the dataset preview text."""
@@ -982,6 +1395,13 @@ class CreatePage(ft.Container):
         self._download_btn.disabled = True
         self._cancel_btn.visible = True
         self._progress_panel.show()
+        
+        # Register with global download manager
+        import uuid
+        self._current_download_id = str(uuid.uuid4())
+        download_manager = self._get_download_manager()
+        if download_manager:
+            download_manager.add_download(self._current_download_id, name)
         
         if self._extend_mode:
             self._status_log.add_info(f"Extending dataset: {name}")
@@ -1201,20 +1621,47 @@ class CreatePage(ft.Container):
                 self.db.mark_granules_downloaded(dataset.id)
                 self._status_log.add_success(f"🎉 Dataset '{name}' created successfully!")
                 self._status_log.add_info(f"   └─ {len(granules)} granules processed")
+                
+                # Update global download manager
+                download_manager = self._get_download_manager()
+                if download_manager and self._current_download_id:
+                    download_manager.complete(self._current_download_id)
+                
+                # Auto-navigate to Workspace after a short delay
+                await asyncio.sleep(1.5)
+                shell = self._get_shell()
+                if shell and hasattr(shell, 'navigate_to'):
+                    shell.navigate_to(f"/workspace/{dataset.id}")
+            else:
+                # Mark as error in download manager
+                download_manager = self._get_download_manager()
+                if download_manager and self._current_download_id:
+                    download_manager.error(self._current_download_id)
             
         except Exception as e:
             self._status_log.add_error(f"Download failed: {e}")
             import traceback
             traceback.print_exc()
+            # Mark as error in download manager
+            download_manager = self._get_download_manager()
+            if download_manager and self._current_download_id:
+                download_manager.error(self._current_download_id)
         
         finally:
             self._is_downloading = False
             self._download_btn.disabled = False
             self._cancel_btn.visible = False
+            self._current_download_id = None
             self.update()
     
     def _on_cancel_click(self, e):
         """Cancel the download."""
         self._is_downloading = False
         self._status_log.add_warning("Cancelling download...")
+        
+        # Cancel in download manager
+        download_manager = self._get_download_manager()
+        if download_manager and self._current_download_id:
+            download_manager.cancel(self._current_download_id)
+        
         self.update()
