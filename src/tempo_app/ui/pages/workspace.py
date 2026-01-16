@@ -12,7 +12,7 @@ import asyncio
 import xarray as xr
 
 from ..theme import Colors, Spacing
-from ..components.widgets import SectionCard, StatusLogPanel
+from ..components.widgets import SectionCard
 from ...storage.database import Database
 from ...storage.models import Dataset, Site
 from ...core.plotter import MapPlotter
@@ -74,7 +74,8 @@ class WorkspacePage(ft.Container):
         
         if not dataset_id:
             self._dataset_title.value = "No datasets available"
-            self._status_log.add_warning("No dataset selected")
+            self._dataset_title.value = "No datasets available"
+            logging.warning("No dataset selected")
             return
             
         self._dataset = await asyncio.to_thread(self.db.get_dataset, dataset_id)
@@ -87,14 +88,14 @@ class WorkspacePage(ft.Container):
             )
             logging.info(f"Found {len(self._sites)} sites in bbox")
             self._update_sites_list()
-            self._status_log.add_info(f"Loaded: {self._dataset.name}")
-            self._status_log.add_info(f"Found {len(self._sites)} sites in bounds")
+            logging.info(f"Loaded: {self._dataset.name}")
+            logging.info(f"Found {len(self._sites)} sites in bounds")
             
             # Load available hours from dataset file
             await self._load_available_hours()
         else:
             self._dataset_title.value = "Dataset not found"
-            self._status_log.add_error(f"Dataset not found: {dataset_id}")
+            logging.error(f"Dataset not found: {dataset_id}")
 
     async def _load_available_hours(self):
         """Load available hours from the dataset file and update slider."""
@@ -118,12 +119,12 @@ class WorkspacePage(ft.Container):
                 timestamps = pd.to_datetime(ds.TIME.values)
                 available_hours = sorted(set(timestamps.hour.tolist()))
                 num_timesteps = len(timestamps)
-                self._status_log.add_info(f"Dataset has {num_timesteps} timesteps ({timestamps[0].date()} to {timestamps[-1].date()})")
+                logging.info(f"Dataset has {num_timesteps} timesteps ({timestamps[0].date()} to {timestamps[-1].date()})")
             elif 'TSTEP' in ds.dims:
                 timestamps = pd.to_datetime(ds.TSTEP.values)
                 available_hours = sorted(set(timestamps.hour.tolist()))
                 num_timesteps = len(timestamps)
-                self._status_log.add_info(f"Dataset has {num_timesteps} timesteps ({timestamps[0].date()} to {timestamps[-1].date()})")
+                logging.info(f"Dataset has {num_timesteps} timesteps ({timestamps[0].date()} to {timestamps[-1].date()})")
             # Fallback to HOUR dimension (old aggregated format)
             elif 'HOUR' in ds.coords:
                 available_hours = sorted(ds.HOUR.values.tolist())
@@ -146,7 +147,7 @@ class WorkspacePage(ft.Container):
                 self._hour_text.value = f"Hour: {min_hour} UTC"
                 
                 hours_str = ", ".join(f"{h}" for h in available_hours)
-                self._status_log.add_info(f"Available hours: {hours_str}")
+                logging.info(f"Available hours: {hours_str}")
                 logging.info(f"Set hour slider: min={min_hour}, max={max_hour}")
         except Exception as e:
             import logging
@@ -261,6 +262,7 @@ class WorkspacePage(ft.Container):
             label="Show Sites",
             value=True,
             label_style=ft.TextStyle(color=Colors.ON_SURFACE),
+            on_change=self._on_show_sites_change,
         )
 
         # Hour slider
@@ -302,7 +304,7 @@ class WorkspacePage(ft.Container):
         self._progress_bar = ft.ProgressBar(visible=False, color=Colors.PRIMARY)
 
         # Status log (shared for map and export)
-        self._status_log = StatusLogPanel()
+
 
         # Controls row
         controls_row = ft.Row([
@@ -321,10 +323,13 @@ class WorkspacePage(ft.Container):
 
         # Map container
         map_container = ft.Container(
-            content=ft.Stack([
-                self._map_placeholder,
-                self._map_image,
-            ]),
+            content=ft.Stack(
+                [
+                    self._map_placeholder,
+                    self._map_image,
+                ],
+                fit=ft.StackFit.EXPAND,
+            ),
             expand=True,
             border=ft.border.all(1, Colors.BORDER),
             border_radius=8,
@@ -338,13 +343,6 @@ class WorkspacePage(ft.Container):
             self._progress_bar,
             ft.Container(height=4),
             map_container,
-            ft.Container(height=8),
-            ft.Container(
-                content=self._status_log,
-                height=100,
-                border=ft.border.all(1, Colors.BORDER),
-                border_radius=8,
-            ),
         ], expand=True, spacing=0)
 
     def _build_sidebar(self):
@@ -470,10 +468,16 @@ class WorkspacePage(ft.Container):
         self._hour_text.value = f"Hour: {hour} UTC"
         self.update()
 
+    def _on_show_sites_change(self, e):
+        """Handle show sites checkbox change - regenerate map."""
+        if self._dataset and self._map_image.visible:
+            # Only regenerate if we have a map already displayed
+            self.page.run_task(self._generate_map_async)
+
     def _on_generate_click(self, e):
         """Generate the map."""
         if not self._dataset:
-            self._status_log.add_error("No dataset loaded")
+            logging.error("No dataset loaded")
             return
         self.page.run_task(self._generate_map_async)
 
@@ -481,7 +485,7 @@ class WorkspacePage(ft.Container):
         """Generate map asynchronously."""
         import logging
         self._progress_bar.visible = True
-        self._status_log.add_info(f"Generating map for hour {self._current_hour}...")
+        logging.info(f"Generating map for hour {self._current_hour}...")
         self.update()
 
         try:
@@ -495,7 +499,7 @@ class WorkspacePage(ft.Container):
             logging.info(f"Looking for processed file: {processed_path}")
             
             if not processed_path.exists():
-                self._status_log.add_error("Processed data not found")
+                logging.error("Processed data not found")
                 self._progress_bar.visible = False
                 self.update()
                 return
@@ -503,10 +507,11 @@ class WorkspacePage(ft.Container):
             ds = await asyncio.to_thread(xr.open_dataset, processed_path)
             logging.info(f"Opened dataset with dims: {list(ds.dims)}")
 
-            # Get sites if checkbox checked
-            sites = None
+            # Get sites if checkbox checked, otherwise pass empty dict to hide sites
             if self._show_sites_checkbox.value:
                 sites = {s.code: s.to_tuple() for s in self._sites}
+            else:
+                sites = {}  # Empty dict = no sites shown
 
             variable = self._variable_dropdown.value
             road_detail = self._road_dropdown.value
@@ -528,23 +533,23 @@ class WorkspacePage(ft.Container):
             ds.close()
             
             logging.info(f"Plotter returned: {plot_path}")
-            self._status_log.add_info(f"Plotter returned: {plot_path}")
+            logging.info(f"Plotter returned: {plot_path}")
 
             if plot_path:
                 if Path(plot_path).exists():
                     self._map_image.src = plot_path
                     self._map_image.visible = True
                     self._map_placeholder.visible = False
-                    self._status_log.add_success(f"Map generated: {variable} at {hour}:00 UTC")
+                    logging.info(f"Map generated: {variable} at {hour}:00 UTC")
                     logging.info(f"Map image set to: {plot_path}")
                 else:
-                    self._status_log.add_error(f"Plot path doesn't exist: {plot_path}")
+                    logging.error(f"Plot path doesn't exist: {plot_path}")
             else:
-                self._status_log.add_error(f"No map returned for hour {hour}")
+                logging.error(f"No map returned for hour {hour}")
 
         except Exception as ex:
             import traceback
-            self._status_log.add_error(f"Error: {ex}")
+            logging.error(f"Error: {ex}")
             logging.error(f"Map generation error: {ex}")
             traceback.print_exc()
         finally:
@@ -554,7 +559,7 @@ class WorkspacePage(ft.Container):
     async def _on_export_nav_click(self, e):
         """Navigate to export page with current dataset."""
         if not self._dataset:
-            self._status_log.add_warning("Select a dataset first to export.")
+            logging.warning("Select a dataset first to export.")
             return
             
         if self.page:

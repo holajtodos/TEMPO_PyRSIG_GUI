@@ -278,6 +278,44 @@ class StatusLogPanel(ft.Container):
         self._log_column.controls.clear()
         self.update()
 
+    def get_handler(self):
+        """Get a logging handler that outputs to this panel."""
+        return StatusLogHandler(self)
+
+
+class StatusLogHandler:
+    """A logging handler that outputs to a StatusLogPanel."""
+    # This is a dummy class definition that will be replaced by the actual inheritance
+    # But since we can't import logging at the top level without potential circular imports or
+    # messing up the file, we'll do it inside.
+    # update: Actually standard library imports are fine.
+    pass
+
+import logging
+
+class StatusLogHandler(logging.Handler):
+    """A logging handler that outputs to a StatusLogPanel."""
+    
+    def __init__(self, panel: StatusLogPanel):
+        super().__init__()
+        self.panel = panel
+        self.setFormatter(logging.Formatter('%(message)s'))
+        
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Map log levels to panel methods
+            if record.levelno >= logging.ERROR:
+                self.panel.add_error(msg)
+            elif record.levelno >= logging.WARNING:
+                self.panel.add_warning(msg)
+            elif record.levelno >= logging.INFO:
+                self.panel.add_info(msg)
+            else:
+                self.panel.add_info(msg) # DEBUG etc
+        except Exception:
+            self.handleError(record)
+
 
 class ProgressPanel(ft.Container):
     """A progress panel showing overall download progress.

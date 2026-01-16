@@ -75,41 +75,57 @@ class MapPlotter:
         import time
 
         try:
-            print(f"DEBUG: Generating map for {variable} @ H{hour}")
+            logger.info(f"Generating map for {variable} @ H{hour}")
             if 'cartopy.crs' not in sys.modules:
-                print("DEBUG: Cartopy not loaded, using fallback.")
+                logger.warning("Cartopy not loaded, using fallback.")
                 return self._generate_dummy_map(variable, hour)
 
+            # Extract date range and available hours info for title
+            import pandas as pd
+            date_range_str = ""
+            
             # Extract data for the specific hour
             # Handle processed data with TIME (new), TSTEP (old datetime), or HOUR (aggregated) dims
             if 'TIME' in dataset.dims:
+                timestamps = pd.to_datetime(dataset.TIME.values)
+                date_range_str = f"{timestamps.min().strftime('%Y-%m-%d')} to {timestamps.max().strftime('%Y-%m-%d')}"
+                available_hours = sorted(set(timestamps.hour.tolist()))
+                
                 # New format: TIME is datetime, need to extract by hour and average
                 if hour not in dataset.TIME.dt.hour.values:
                     print(f"DEBUG: Hour {hour} not found in dataset TIME: {dataset.TIME.dt.hour.values}")
                     return None
                 ds_hour = dataset.sel(TIME=dataset.TIME.dt.hour == hour).mean(dim='TIME')
             elif 'TSTEP' in dataset.dims:
+                timestamps = pd.to_datetime(dataset.TSTEP.values)
+                date_range_str = f"{timestamps.min().strftime('%Y-%m-%d')} to {timestamps.max().strftime('%Y-%m-%d')}"
+                available_hours = sorted(set(timestamps.hour.tolist()))
+                
                 # Old format: TSTEP is datetime, need to extract by hour
                 if hour not in dataset.TSTEP.dt.hour.values:
                     print(f"DEBUG: Hour {hour} not found in dataset TSTEP: {dataset.TSTEP.dt.hour.values}")
                     return None
                 ds_hour = dataset.sel(TSTEP=dataset.TSTEP.dt.hour == hour).mean(dim='TSTEP')
             elif 'HOUR' in dataset.dims:
+                available_hours = sorted(dataset.HOUR.values.tolist())
+                
                 # Aggregated format: dimension is integer hours
                 if hour not in dataset.HOUR.values:
                     print(f"DEBUG: Hour {hour} not found in dataset HOURs: {dataset.HOUR.values}")
                     return None
                 ds_hour = dataset.sel(HOUR=hour)
             elif 'hour' in dataset.dims:
+                available_hours = sorted(dataset.hour.values.tolist())
+                
                 # Legacy format: dimension is integer hours
                 if hour not in dataset.hour.values:
                     print(f"DEBUG: Hour {hour} not found in dataset hours: {dataset.hour.values}")
                     return None
                 ds_hour = dataset.sel(hour=hour)
             else:
-                print(f"DEBUG: Dataset has no recognized time dimension. Dims: {list(dataset.dims)}")
+                logger.error(f"Dataset has no recognized time dimension. Dims: {list(dataset.dims)}")
                 return None
-            print(f"DEBUG: Extracted hour {hour} slice.")
+            logger.debug(f"Extracted hour {hour} slice.")
             
             if variable == 'FNR':
                 data = ds_hour['FNR']
@@ -142,7 +158,7 @@ class MapPlotter:
                 
             data = data.squeeze(drop=True)
             if data.isnull().all():
-                print(f"DEBUG: Data for {variable} is all NaN (empty) for hour {hour}.")
+                logger.warning(f"Data for {variable} is all NaN (empty) for hour {hour}.")
                 return None
 
             # Setup plot
@@ -172,7 +188,7 @@ class MapPlotter:
             try:
                 self._add_road_overlay(ax, bbox, road_detail, road_scale)
             except Exception as road_err:
-                print(f"DEBUG: Road overlay failed (non-fatal): {road_err}")
+                logger.warning(f"Road overlay failed (non-fatal): {road_err}")
             
             # Plot Data
             mesh = ax.pcolormesh(lons, lats, data, cmap=cmap, norm=norm, 
@@ -203,7 +219,15 @@ class MapPlotter:
             cbar.ax.tick_params(labelsize=font_size)
             cbar.set_label(label, size=font_size)
             ax.gridlines(draw_labels=True, linewidth=1, color='gray', alpha=0.3, linestyle='--')
-            ax.set_title(f"{variable} - {dataset_name}\n{hour:02d}:00 UTC", fontsize=title_size)
+            # Build title with extra info
+            title_parts = [f"{variable} - {dataset_name}"]
+            if date_range_str:
+                title_parts.append(date_range_str)
+            
+            # Add current hour line
+            title_parts.append(f"{hour:02d}:00 UTC")
+            
+            ax.set_title("\n".join(title_parts), fontsize=title_size)
             
             # Save to temp file with descriptive name + unique timestamp
             import time
@@ -214,7 +238,7 @@ class MapPlotter:
             plt.savefig(temp_path, dpi=100, bbox_inches='tight')
             plt.close(fig)
             
-            print(f"DEBUG: Map saved to {temp_path}")
+            logger.info(f"Map saved to {temp_path}")
             return str(temp_path)
             
         except Exception as e:

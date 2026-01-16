@@ -39,15 +39,13 @@ HELP_TEXTS = {
         "- latitude (or lat): Site latitude in decimal degrees\n"
         "- longitude (or lon): Site longitude in decimal degrees\n\n"
         "Optional columns:\n"
-        "- radius_km: Custom radius for bounding box (default: 10km)\n"
         "- date_start, date_end: Custom date range for this site\n"
         "- max_cloud, max_sza: Custom quality filters"
     ),
     "default_radius": (
         "Default radius in kilometers for calculating bounding boxes.\n\n"
         "A bounding box will be created around each site's coordinates\n"
-        "using this radius. Sites can override this with a custom radius\n"
-        "in the Excel file.\n\n"
+        "using this radius.\n\n"
         "Typical values: 5-20 km depending on area of interest."
     ),
     "batch_size": (
@@ -111,12 +109,12 @@ class BatchImportPage(ft.Container):
         # Sites preview table
         self._sites_table = ft.DataTable(
             columns=[
-                ft.DataColumn(ft.Text("Row", size=12)),
-                ft.DataColumn(ft.Text("Name", size=12)),
-                ft.DataColumn(ft.Text("Latitude", size=12)),
-                ft.DataColumn(ft.Text("Longitude", size=12)),
-                ft.DataColumn(ft.Text("Radius", size=12)),
-                ft.DataColumn(ft.Text("Status", size=12)),
+                ft.DataColumn(ft.Text("Row", size=12, color=Colors.ON_SURFACE)),
+                ft.DataColumn(ft.Text("Name", size=12, color=Colors.ON_SURFACE)),
+                ft.DataColumn(ft.Text("Latitude", size=12, color=Colors.ON_SURFACE)),
+                ft.DataColumn(ft.Text("Longitude", size=12, color=Colors.ON_SURFACE)),
+
+                ft.DataColumn(ft.Text("Status", size=12, color=Colors.ON_SURFACE)),
             ],
             rows=[],
             border=ft.border.all(1, Colors.BORDER),
@@ -556,8 +554,7 @@ class BatchImportPage(ft.Container):
         self._file_path_text.italic = False
 
         # Parse the file
-        default_radius = self._default_radius.value
-        self._parse_result = parse_import_file(file_path, default_radius)
+        self._parse_result = parse_import_file(file_path)
 
         # Update UI with results
         self._update_parse_results()
@@ -588,7 +585,7 @@ class BatchImportPage(ft.Container):
         # Update table
         rows = []
         for site in result.sites[:50]:  # Limit to 50 for performance
-            radius_text = f"{site.radius_km:.1f}" if site.radius_km else "default"
+
 
             if site.error:
                 status_icon = ft.Icon(ft.Icons.ERROR, size=16, color=Colors.ERROR)
@@ -599,12 +596,12 @@ class BatchImportPage(ft.Container):
 
             rows.append(ft.DataRow(
                 cells=[
-                    ft.DataCell(ft.Text(str(site.row_number), size=12)),
-                    ft.DataCell(ft.Text(site.site_name[:20], size=12)),
-                    ft.DataCell(ft.Text(f"{site.latitude:.4f}", size=12)),
-                    ft.DataCell(ft.Text(f"{site.longitude:.4f}", size=12)),
-                    ft.DataCell(ft.Text(radius_text, size=12)),
-                    ft.DataCell(ft.Row([status_icon, ft.Text(status_text, size=11)], spacing=4)),
+                    ft.DataCell(ft.Text(str(site.row_number), size=12, color=Colors.ON_SURFACE)),
+                    ft.DataCell(ft.Text(site.site_name[:20], size=12, color=Colors.ON_SURFACE)),
+                    ft.DataCell(ft.Text(f"{site.latitude:.4f}", size=12, color=Colors.ON_SURFACE)),
+                    ft.DataCell(ft.Text(f"{site.longitude:.4f}", size=12, color=Colors.ON_SURFACE)),
+
+                    ft.DataCell(ft.Row([status_icon, ft.Text(status_text, size=11, color=Colors.ON_SURFACE)], spacing=4)),
                 ]
             ))
 
@@ -726,7 +723,7 @@ class BatchImportPage(ft.Container):
         # Create batch sites
         batch_sites = []
         for i, parsed_site in enumerate(self._parse_result.valid_sites):
-            radius = parsed_site.radius_km or default_radius
+            radius = default_radius
             bbox = bbox_from_center(parsed_site.latitude, parsed_site.longitude, radius)
 
             batch_site = BatchSite(

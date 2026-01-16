@@ -20,6 +20,11 @@ class ParsedSite:
     site_name: str
     latitude: float
     longitude: float
+
+    custom_date_start: Optional[str] = None  # ISO format date string
+    custom_date_end: Optional[str] = None  # ISO format date string
+    custom_max_cloud: Optional[float] = None  # Max cloud fraction
+    custom_max_sza: Optional[float] = None  # Max solar zenith angle
     error: Optional[str] = None  # Validation error for this row
 
 
@@ -89,16 +94,15 @@ def _parse_date_value(value) -> Optional[str]:
     return str(value)
 
 
-def parse_import_file(file_path: Path, default_radius_km: float = 10.0) -> ParseResult:
+def parse_import_file(file_path: Path) -> ParseResult:
     """Parse an Excel or CSV file for batch site import.
 
     Expected columns:
         Required: name (or site_name), latitude (or lat), longitude (or lon)
-        Optional: radius_km, date_start, date_end, max_cloud, max_sza
+        Optional: date_start, date_end, max_cloud, max_sza
 
     Args:
         file_path: Path to .xlsx, .xls, or .csv file
-        default_radius_km: Default radius if not specified per-site
 
     Returns:
         ParseResult with parsed sites and any errors/warnings
@@ -151,6 +155,11 @@ def parse_import_file(file_path: Path, default_radius_km: float = 10.0) -> Parse
         return result
 
     # Find optional columns
+    # Radius column removed as per user request
+    date_start_col = _find_column(df, ["date_start", "start_date"])
+    date_end_col = _find_column(df, ["date_end", "end_date"])
+    max_cloud_col = _find_column(df, ["max_cloud", "cloud_fraction", "cloud"])
+    max_sza_col = _find_column(df, ["max_sza", "sza", "solar_zenith"])
 
     # Parse each row
     for idx, row in df.iterrows():
@@ -194,6 +203,25 @@ def parse_import_file(file_path: Path, default_radius_km: float = 10.0) -> Parse
             result.sites.append(site)
             continue
 
+        # Parse optional fields
+        if date_start_col and pd.notna(row[date_start_col]):
+            site.custom_date_start = _parse_date_value(row[date_start_col])
+
+        if date_end_col and pd.notna(row[date_end_col]):
+            site.custom_date_end = _parse_date_value(row[date_end_col])
+
+        if max_cloud_col and pd.notna(row[max_cloud_col]):
+            try:
+                site.custom_max_cloud = float(row[max_cloud_col])
+            except (ValueError, TypeError):
+                result.warnings.append(f"Row {row_num}: Invalid max_cloud, using default")
+
+        if max_sza_col and pd.notna(row[max_sza_col]):
+            try:
+                site.custom_max_sza = float(row[max_sza_col])
+            except (ValueError, TypeError):
+                result.warnings.append(f"Row {row_num}: Invalid max_sza, using default")
+
         result.sites.append(site)
 
     # Final validation
@@ -216,7 +244,6 @@ def create_sample_excel(file_path: Path, num_sites: int = 5) -> None:
         "name": [f"Site_{i+1}" for i in range(num_sites)],
         "latitude": [40.0 + i * 0.5 for i in range(num_sites)],
         "longitude": [-111.0 - i * 0.5 for i in range(num_sites)],
-        "radius_km": [10.0] * num_sites,
         "date_start": ["2024-01-01"] * num_sites,
         "date_end": ["2024-01-31"] * num_sites,
         "max_cloud": [0.3] * num_sites,
