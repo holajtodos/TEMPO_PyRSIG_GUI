@@ -125,6 +125,12 @@ NAV_ITEMS = [
         route="/workspace",
     ),
     NavigationItem(
+        icon=ft.Icons.AUTO_AWESOME_OUTLINED,
+        selected_icon=ft.Icons.AUTO_AWESOME,
+        label="AI Analysis",
+        route="/ai",
+    ),
+    NavigationItem(
         icon=ft.Icons.FILE_DOWNLOAD_OUTLINED,
         selected_icon=ft.Icons.FILE_DOWNLOAD,
         label="Export",

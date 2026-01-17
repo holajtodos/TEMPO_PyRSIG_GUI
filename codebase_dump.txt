@@ -1,6 +1,6 @@
 ==================================
 TEMPO Analyzer Codebase Dump
-Generated: Thu Jan 15 23:24:28 PST 2026
+Generated: Fri Jan 16 11:58:08 PST 2026
 ==================================
 
 
@@ -310,6 +310,7 @@ class BatchScheduler:
         db: Database,
         data_dir: Path,
         max_concurrent_sites: int = 5,
+        api_key: str = "",
         on_progress: Optional[Callable[[BatchJob, BatchSite, str], None]] = None,
         on_site_complete: Optional[Callable[[BatchSite], None]] = None,
         on_job_complete: Optional[Callable[[BatchJob], None]] = None,
@@ -320,6 +321,7 @@ class BatchScheduler:
             db: Database instance for persistence
             data_dir: Base directory for datasets
             max_concurrent_sites: Maximum sites to process in parallel
+            api_key: RSIG API key for downloads (empty = anonymous)
             on_progress: Callback for progress updates
             on_site_complete: Callback when a site finishes
             on_job_complete: Callback when the entire job finishes
@@ -327,6 +329,7 @@ class BatchScheduler:
         self.db = db
         self.data_dir = data_dir
         self.max_concurrent_sites = max_concurrent_sites
+        self.api_key = api_key
         self.on_progress = on_progress
         self.on_site_complete = on_site_complete
         self.on_job_complete = on_job_complete
@@ -497,7 +500,7 @@ class BatchScheduler:
                 self.on_progress(job, site, f"Downloading {site.site_name} ({len(granules)} granules)")
 
             # Download
-            downloader = RSIGDownloader(dataset_dir, max_concurrent=4)
+            downloader = RSIGDownloader(dataset_dir, max_concurrent=4, api_key=self.api_key)
             files = await downloader.download_granules(
                 dates=dates_list,
                 hours=hours_list,
@@ -821,6 +824,7 @@ class ConfigManager:
         "font_scale": 1.0,
         "theme_mode": "light", # Reserved for future
         "download_workers": 8,  # Number of parallel download workers
+        "rsig_api_key": "",  # NASA RSIG API key (optional but recommended)
     }
     
     def __init__(self, app_name: str = "tempo_analyzer"):
@@ -871,6 +875,11 @@ class ConfigManager:
     @property
     def download_workers(self) -> int:
         return self._config.get("download_workers", 4)
+
+    @property
+    def rsig_api_key(self) -> str:
+        """Get the configured RSIG API key."""
+        return self._config.get("rsig_api_key", "")
 
 
 ========================================
@@ -933,8 +942,6 @@ from datetime import datetime
 import json
 import logging
 import time
-import random
-import string
 import gc
 import traceback
 
@@ -977,21 +984,17 @@ def format_duration(seconds: float) -> str:
         return f"{h}h {m}m" if m else f"{h}h"
 
 
-def generate_random_api_key() -> str:
-    """Generate a random API key string for anonymous access."""
-    # Generate a random 16-char alphanumeric string
-    chars = string.ascii_lowercase + string.digits
-    random_part = ''.join(random.choices(chars, k=16))
-    return f"anon_{random_part}"
+
 
 
 class RSIGDownloader:
     """Handles downloading TEMPO data from EPA RSIG API with parallel execution."""
     
-    def __init__(self, workdir: Path, max_concurrent: int = MAX_CONCURRENT_DOWNLOADS):
+    def __init__(self, workdir: Path, max_concurrent: int = MAX_CONCURRENT_DOWNLOADS, api_key: str = ""):
         self.workdir = workdir
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.max_concurrent = max_concurrent
+        self.api_key = api_key  # Configured API key (empty = anonymous)
         
         # Shared state for progress tracking
         self._completed = 0
@@ -1007,7 +1010,10 @@ class RSIGDownloader:
                               max_sza: float = 70.0,
                               status: StatusManager = None) -> list[Path]:
         """
-        Download TEMPO granules for the specified criteria using parallel execution.
+        Download TEMPO granules using daily batch requests with controlled parallelism.
+        
+        This approach uses daily batches (instead of per-hour) to reduce server load,
+        while still allowing parallel processing of multiple days for speed.
         
         Args:
             dates: List of date strings (YYYY-MM-DD)
@@ -1028,55 +1034,227 @@ class RSIGDownloader:
         dataset_dir = self.workdir
         dataset_dir.mkdir(parents=True, exist_ok=True)
         
-        # Build list of all (date, hour) combinations to download
-        download_tasks = []
-        for d_str in dates:
-            for h in hours:
-                download_tasks.append((d_str, h))
+        # Determine hour range for daily requests
+        min_hour = min(hours)
+        max_hour = max(hours)
         
-        self._total = len(download_tasks)
+        self._total = len(dates)  # Counting days
         self._completed = 0
         
         if status:
-            status.emit("info", f"🚀 Starting parallel download: {self._total} granules with {self.max_concurrent} workers")
+            status.emit("info", f"🚀 Daily batch download: {self._total} days × {len(hours)} hours, {self.max_concurrent} workers")
         
-        logger.info(f"[PARALLEL] Starting {self._total} downloads with {self.max_concurrent} concurrent workers")
+        logger.info(f"[BATCH] Downloading {self._total} days with {self.max_concurrent} parallel workers")
         
-        # Create semaphore to limit concurrent downloads
+        # Use configured API key or anonymous
+        api_key = self.api_key if self.api_key else "anonymous"
+        
+        start_time = time.time()
+        
+        # Create semaphore for controlled parallelism
         semaphore = asyncio.Semaphore(self.max_concurrent)
         
-        # Create download worker coroutine
-        async def download_worker(d_str: str, hour: int) -> Path | None:
+        async def download_day_worker(d_str: str, worker_id: int) -> list[Path]:
+            """Worker that downloads one day with its own API session."""
             async with semaphore:
-                return await self._download_single_granule(
-                    d_str, hour, bbox, max_cloud, max_sza, dataset_dir, status
-                )
+                import tempfile
+                import shutil
+                
+                # Each worker gets its own temp directory and API session
+                temp_dir = tempfile.mkdtemp(prefix=f"rsig_w{worker_id}_")
+                
+                try:
+                    # Create API session for this worker
+                    api = RsigApi(bbox=bbox, workdir=temp_dir, grid_kw='1US1', gridfit=True)
+                    api.tempo_kw.update({
+                        'minimum_quality': 'normal',
+                        'maximum_cloud_fraction': max_cloud,
+                        'maximum_solar_zenith_angle': max_sza,
+                        'api_key': api_key
+                    })
+                    
+                    if status:
+                        async with self._lock:
+                            progress = self._completed / self._total
+                        status.emit("download", f"⬇️ W{worker_id}: {d_str}", progress)
+                    
+                    # Download entire day in one request
+                    result = await self._download_daily_batch(
+                        api, d_str, min_hour, max_hour, hours, dataset_dir, status
+                    )
+                    
+                    async with self._lock:
+                        self._completed += 1
+                    
+                    return result if result else []
+                    
+                except Exception as e:
+                    logger.error(f"[BATCH] Worker {worker_id} failed for {d_str}: {e}")
+                    if status:
+                        status.emit("error", f"❌ W{worker_id}: {d_str} - {e}")
+                    async with self._lock:
+                        self._completed += 1
+                    return []
+                    
+                finally:
+                    try:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    except:
+                        pass
         
-        # Launch all downloads concurrently (semaphore limits actual parallelism)
-        start_time = time.time()
-        tasks = [download_worker(d_str, h) for d_str, h in download_tasks]
+        # Launch all day downloads in parallel (semaphore controls actual concurrency)
+        tasks = [download_day_worker(d_str, i % self.max_concurrent + 1) for i, d_str in enumerate(dates)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        elapsed = time.time() - start_time
-        
-        # Collect successful downloads
+        # Collect results
         saved_files = []
         errors = 0
         for result in results:
             if isinstance(result, Exception):
                 errors += 1
-                logger.error(f"[PARALLEL] Task exception: {result}")
-            elif result is not None:
-                saved_files.append(result)
-            else:
-                # None means no data for that hour (not an error)
-                pass
+                logger.error(f"[BATCH] Task exception: {result}")
+            elif result:
+                saved_files.extend(result)
         
-        logger.info(f"[PARALLEL] Complete: {len(saved_files)} saved, {errors} errors in {elapsed:.1f}s")
+        elapsed = time.time() - start_time
+        
+        logger.info(f"[BATCH] Complete: {len(saved_files)} files, {errors} errors in {elapsed:.1f}s")
         if status:
-            status.emit("ok", f"✅ Downloaded {len(saved_files)}/{self._total} granules in {format_duration(elapsed)}")
+            status.emit("ok", f"✅ Downloaded {len(saved_files)} granules from {self._total} days in {format_duration(elapsed)}")
         
         return saved_files
+    
+    async def _download_daily_batch(
+        self,
+        api: 'RsigApi',
+        d_str: str,
+        min_hour: int,
+        max_hour: int,
+        hours: list[int],
+        dataset_dir: Path,
+        status: StatusManager
+    ) -> list[Path]:
+        """Download an entire day's worth of data in one request.
+        
+        Uses a persistent API session to maintain connection and reduce overhead.
+        Splits the returned data into per-hour files for consistent processing.
+        """
+        logger.info(f"[BATCH] Fetching day {d_str} (hours {min_hour:02d}-{max_hour:02d})")
+        
+        def _fetch_day():
+            """Synchronous fetch for entire day range."""
+            d_obj = pd.to_datetime(d_str)
+            bdate = d_obj + pd.to_timedelta(min_hour, unit='h')
+            edate = d_obj + pd.to_timedelta(max_hour, unit='h') + pd.to_timedelta('59m')
+            
+            logger.info(f"[BATCH] Requesting NO2: {bdate} to {edate}")
+            no2ds = api.to_ioapi('tempo.l2.no2.vertical_column_troposphere', bdate=bdate, edate=edate)
+            
+            logger.info(f"[BATCH] Requesting HCHO: {bdate} to {edate}")
+            hchods = api.to_ioapi('tempo.l2.hcho.vertical_column', bdate=bdate, edate=edate)
+            
+            return no2ds, hchods
+        
+        try:
+            no2ds, hchods = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_day),
+                timeout=DOWNLOAD_TIMEOUT * 3  # Longer timeout for daily batches
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"[BATCH] Timeout fetching day {d_str}")
+            if status:
+                status.emit("error", f"⏱️ Timeout: {d_str}")
+            return []
+        except Exception as e:
+            error_str = str(e)
+            if "Unknown file format" in error_str or "NetCDF: Unknown file format" in error_str:
+                logger.info(f"[BATCH] No data available for {d_str}")
+                return []
+            raise
+        
+        # Split into per-hour files for consistent downstream processing
+        saved = []
+        
+        try:
+            # Get timestamps from the response
+            if 'TSTEP' in no2ds.dims:
+                timestamps = pd.to_datetime(no2ds.TSTEP.values)
+            else:
+                # Single timestep, just use requested hours
+                timestamps = [pd.to_datetime(d_str) + pd.to_timedelta(h, unit='h') for h in hours]
+            
+            # Group data by hour
+            for hour in hours:
+                # Check if this hour has data
+                hour_data_mask = [t.hour == hour for t in timestamps]
+                if not any(hour_data_mask):
+                    continue
+                
+                filename = f"tempo_{d_str}_{hour:02d}.nc"
+                filepath = dataset_dir / filename
+                
+                # Extract data for this hour
+                if 'TSTEP' in no2ds.dims:
+                    hour_indices = [i for i, m in enumerate(hour_data_mask) if m]
+                    if not hour_indices:
+                        continue
+                    
+                    no2_hour = no2ds.isel(TSTEP=hour_indices)
+                    hcho_hour = hchods.isel(TSTEP=hour_indices) if 'TSTEP' in hchods.dims else hchods
+                else:
+                    no2_hour = no2ds
+                    hcho_hour = hchods
+                
+                # Create output dataset
+                outds = xr.Dataset(attrs=dict(no2ds.attrs))
+                
+                if 'LATITUDE' in no2_hour:
+                    lat_data = no2_hour['LATITUDE']
+                    if 'TSTEP' in lat_data.dims:
+                        lat_data = lat_data.isel(TSTEP=0)
+                    if 'LAY' in lat_data.dims:
+                        lat_data = lat_data.isel(LAY=0)
+                    outds.coords['LAT'] = (('ROW', 'COL'), lat_data.values.copy())
+                    
+                if 'LONGITUDE' in no2_hour:
+                    lon_data = no2_hour['LONGITUDE']
+                    if 'TSTEP' in lon_data.dims:
+                        lon_data = lon_data.isel(TSTEP=0)
+                    if 'LAY' in lon_data.dims:
+                        lon_data = lon_data.isel(LAY=0)
+                    outds.coords['LON'] = (('ROW', 'COL'), lon_data.values.copy())
+                
+                n_var = no2_hour.get('NO2_VERTICAL_CO', xr.DataArray(np.nan))
+                h_var = hcho_hour.get('VERTICAL_COLUMN', xr.DataArray(np.nan))
+                
+                if 'LAY' in n_var.dims: n_var = n_var.isel(LAY=0)
+                if 'LAY' in h_var.dims: h_var = h_var.isel(LAY=0)
+                if 'TSTEP' in n_var.dims: n_var = n_var.mean(dim='TSTEP')
+                if 'TSTEP' in h_var.dims: h_var = h_var.mean(dim='TSTEP')
+                
+                outds['NO2_TropVCD'] = xr.DataArray(n_var.values.copy(), dims=n_var.dims, attrs=dict(n_var.attrs) if hasattr(n_var, 'attrs') else {})
+                outds['HCHO_TotVCD'] = xr.DataArray(h_var.values.copy(), dims=h_var.dims, attrs=dict(h_var.attrs) if hasattr(h_var, 'attrs') else {})
+                
+                # Check validity
+                if outds['NO2_TropVCD'].isnull().all() and outds['HCHO_TotVCD'].isnull().all():
+                    continue
+                
+                # Save file
+                await asyncio.to_thread(lambda: outds.to_netcdf(filepath, engine='netcdf4', compute=True))
+                outds.close()
+                
+                fsize = filepath.stat().st_size
+                if fsize > 1000:
+                    saved.append(filepath)
+                    logger.info(f"[BATCH] Saved: {filename} ({fsize/1024:.1f} KB)")
+                else:
+                    filepath.unlink()
+                    
+        finally:
+            no2ds.close()
+            hchods.close()
+        
+        return saved
     
     async def _download_single_granule(
         self, 
@@ -1088,136 +1266,10 @@ class RSIGDownloader:
         dataset_dir: Path,
         status: StatusManager
     ) -> Path | None:
-        """Download a single granule with random API key."""
-        
-        # Generate unique API key for this worker
-        api_key = generate_random_api_key()
-        
-        filename = f"tempo_{d_str}_{hour:02d}.nc"
-        filepath = dataset_dir / filename
-        
-        logger.info(f"[WORKER] Starting: {d_str} {hour:02d}:00 (key={api_key[:12]}...)")
-        
-        if status:
-            async with self._lock:
-                progress = self._completed / self._total if self._total > 0 else 0
-            status.emit("download", f"⬇️ {d_str} @ {hour:02d}:00 UTC", progress)
-        
-        def _fetch_hour():
-            """Synchronous fetch function to run in thread."""
-            import tempfile
-            import shutil
-            
-            temp_dir = tempfile.mkdtemp(prefix=f"rsig_{api_key[:8]}_")
-            
-            try:
-                # Setup API with unique random key
-                api = RsigApi(bbox=bbox, workdir=temp_dir, grid_kw='1US1', gridfit=True)
-                api.tempo_kw.update({
-                    'minimum_quality': 'normal',
-                    'maximum_cloud_fraction': max_cloud,
-                    'maximum_solar_zenith_angle': max_sza,
-                    'api_key': api_key  # Random key for this worker
-                })
-                
-                d_obj = pd.to_datetime(d_str)
-                bdate = d_obj + pd.to_timedelta(hour, unit='h')
-                edate = bdate + pd.to_timedelta('59m')
-                
-                logger.info(f"[WORKER] Fetching NO2 for {bdate}")
-                no2ds = api.to_ioapi('tempo.l2.no2.vertical_column_troposphere', bdate=bdate, edate=edate)
-                
-                logger.info(f"[WORKER] Fetching HCHO for {bdate}")
-                hchods = api.to_ioapi('tempo.l2.hcho.vertical_column', bdate=bdate, edate=edate)
-                
-                # Merge into output dataset
-                outds = xr.Dataset(attrs=dict(no2ds.attrs))
-                
-                if 'LATITUDE' in no2ds:
-                    outds.coords['LAT'] = (('ROW', 'COL'), no2ds['LATITUDE'].isel(TSTEP=0, LAY=0).values.copy())
-                if 'LONGITUDE' in no2ds:
-                    outds.coords['LON'] = (('ROW', 'COL'), no2ds['LONGITUDE'].isel(TSTEP=0, LAY=0).values.copy())
-                
-                n_var = no2ds.get('NO2_VERTICAL_CO', xr.DataArray(np.nan, coords=no2ds.coords, dims=no2ds.dims))
-                h_var = hchods.get('VERTICAL_COLUMN', xr.DataArray(np.nan, coords=hchods.coords, dims=hchods.dims))
-                
-                if 'LAY' in n_var.dims: n_var = n_var.isel(LAY=0)
-                if 'LAY' in h_var.dims: h_var = h_var.isel(LAY=0)
-                
-                outds['NO2_TropVCD'] = xr.DataArray(n_var.values.copy(), dims=n_var.dims, attrs=dict(n_var.attrs))
-                outds['HCHO_TotVCD'] = xr.DataArray(h_var.values.copy(), dims=h_var.dims, attrs=dict(h_var.attrs))
-                
-                # Check validity
-                if outds['NO2_TropVCD'].isnull().all() and outds['HCHO_TotVCD'].isnull().all():
-                    logger.info(f"[WORKER] No valid data for {bdate}")
-                    no2ds.close()
-                    hchods.close()
-                    return None
-                
-                no2ds.close()
-                hchods.close()
-                
-                return outds
-                
-            except Exception as e:
-                # Check for "Unknown file format" or empty/corrupt file which means no data
-                error_str = str(e)
-                if "Unknown file format" in error_str or "NetCDF: Unknown file format" in error_str:
-                    logger.info(f"[WORKER] No data available for {d_str} {hour:02d}:00 (server returned empty/invalid file)")
-                    return None  # Return None to indicate no data (not an error)
-                    
-                logger.error(f"[WORKER] Fetch failed for {d_str} {hour:02d}:00: {e}")
-                logger.error(f"[WORKER] Traceback:\n{traceback.format_exc()}")
-                return e  # Return exception for handling
-            finally:
-                try:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                except:
-                    pass
-        
-        # Run fetch in thread with timeout
-        try:
-            ds = await asyncio.wait_for(
-                asyncio.to_thread(_fetch_hour),
-                timeout=DOWNLOAD_TIMEOUT
-            )
-            
-            # Check if fetch returned an exception
-            if isinstance(ds, Exception):
-                if status:
-                    status.emit("error", f"❌ Fetch failed: {d_str} {hour:02d}:00 - {ds}")
-                async with self._lock:
-                    self._completed += 1
-                return None
-            
-            # Update progress
-            async with self._lock:
-                self._completed += 1
-                progress = self._completed / self._total
-            
-            if ds is None:
-                if status:
-                    status.emit("warning", f"⚠️ No data: {d_str} {hour:02d}:00")
-                return None
-            
-            # Save to disk
-            return await self._save_granule(ds, filepath, filename, progress, status)
-            
-        except asyncio.TimeoutError:
-            logger.error(f"[WORKER] Timeout: {d_str} {hour:02d}:00")
-            if status:
-                status.emit("error", f"⏱️ Timeout: {d_str} {hour:02d}:00")
-            async with self._lock:
-                self._completed += 1
-            return None
-        except Exception as e:
-            logger.error(f"[WORKER] Exception: {d_str} {hour:02d}:00 - {e}")
-            logger.error(f"[WORKER] Traceback:\n{traceback.format_exc()}")
-            if status:
-                status.emit("error", f"❌ Error: {d_str} {hour:02d}:00 - {e}")
-            async with self._lock:
-                self._completed += 1
-            return None
+        """Legacy method - kept for backwards compatibility but not used."""
+        # Now handled by _download_daily_batch
+        return None
+    
     
     async def _save_granule(
         self, 
@@ -7501,10 +7553,12 @@ class BatchImportPage(ft.Container):
         self._status_log.add_info(f"Processing {job.total_sites} sites with batch size {batch_size}")
 
         # Create scheduler and start
+        api_key = self.config.rsig_api_key if self.config else ""
         self._scheduler = BatchScheduler(
             db=self.db,
             data_dir=self.data_dir,
             max_concurrent_sites=batch_size,
+            api_key=api_key,
             on_progress=self._on_progress,
             on_site_complete=self._on_site_complete,
             on_job_complete=self._on_job_complete,
@@ -7613,10 +7667,12 @@ class BatchImportPage(ft.Container):
         self._status_log.add_info(f"Resuming job: {job.name}")
 
         # Create scheduler and start
+        api_key = self.config.rsig_api_key if self.config else ""
         self._scheduler = BatchScheduler(
             db=self.db,
             data_dir=self.data_dir,
             max_concurrent_sites=job.batch_size,
+            api_key=api_key,
             on_progress=self._on_progress,
             on_site_complete=self._on_site_complete,
             on_job_complete=self._on_job_complete,
@@ -9177,7 +9233,8 @@ class CreatePage(ft.Container):
             
             # Initialize downloader with the named dataset directory and configured workers
             num_workers = self.config.download_workers if self.config else 4
-            downloader = RSIGDownloader(datasets_dir, max_concurrent=num_workers)
+            api_key = self.config.rsig_api_key if self.config else ""
+            downloader = RSIGDownloader(datasets_dir, max_concurrent=num_workers, api_key=api_key)
             adapter = UIStatusAdapter(
                 self._status_log, 
                 self._progress_panel,
@@ -12000,6 +12057,38 @@ class SettingsPage(ft.Container):
             ),
         ], spacing=10))
         
+        # API Key Section
+        self._api_key_input = ft.TextField(
+            value=self.config.rsig_api_key,
+            label="RSIG API Key",
+            password=True,
+            can_reveal_password=True,
+            text_style=ft.TextStyle(color=Colors.ON_SURFACE),
+            border_color=Colors.BORDER,
+            expand=True,
+            text_size=14,
+            hint_text="Enter your NASA RSIG API key (optional)",
+        )
+        
+        api_section = SectionCard("API Configuration", ft.Column([
+            ft.Text("NASA RSIG API Key", color=Colors.ON_SURFACE),
+            ft.Row([
+                ft.Icon(ft.Icons.KEY, color=Colors.PRIMARY),
+                self._api_key_input,
+                ft.IconButton(
+                    icon=ft.Icons.SAVE, 
+                    icon_color=Colors.PRIMARY,
+                    tooltip="Save API Key",
+                    on_click=self._on_save_api_key
+                )
+            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            ft.Text(
+                "An API key is recommended for reliable data downloads. "
+                "Leave empty for anonymous access (may have limits).", 
+                size=12, color=Colors.ON_SURFACE_VARIANT
+            ),
+        ], spacing=10))
+        
         # Content
         self.content = ft.Column([
             header,
@@ -12008,6 +12097,8 @@ class SettingsPage(ft.Container):
             appearance_section,
             ft.Container(height=10),
             download_section,
+            ft.Container(height=10),
+            api_section,
             ft.Container(height=20),
         ], scroll=ft.ScrollMode.AUTO)
         
@@ -12030,6 +12121,20 @@ class SettingsPage(ft.Container):
         if self.page:
             self.page.snack_bar = ft.SnackBar(
                 ft.Text(f"Download workers set to {new_workers}"),
+                duration=2000
+            )
+            self.page.snack_bar.open = True
+            self.page.update()
+
+    def _on_save_api_key(self, e):
+        """Save the API key."""
+        api_key = self._api_key_input.value.strip()
+        self.config.set("rsig_api_key", api_key)
+        
+        if self.page:
+            msg = "API key saved!" if api_key else "API key cleared (using anonymous access)"
+            self.page.snack_bar = ft.SnackBar(
+                ft.Text(msg),
                 duration=2000
             )
             self.page.snack_bar.open = True

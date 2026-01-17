@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, date
 from enum import Enum
 from typing import Optional
+from uuid import uuid4
 import json
 import hashlib
 
@@ -189,6 +190,49 @@ class ExportRecord:
     file_path: str = ""
     created_at: datetime = field(default_factory=datetime.now)
     file_size_bytes: int = 0
+
+
+@dataclass
+class Analysis:
+    """
+    Stores a saved chart analysis with its generated code.
+    
+    Attributes:
+        id: Unique identifier
+        dataset_id: Which dataset this analysis uses
+        name: User-friendly name (e.g., "NO₂ Hourly Trends")
+        query: Original natural language query
+        code: Generated matplotlib code (editable)
+        plot_path: Path to saved PNG file
+        created_at: When first generated
+        updated_at: When code was last edited/re-run
+        error_message: If execution failed, store error here
+    """
+    id: str
+    dataset_id: str
+    name: str
+    query: str
+    code: str
+    plot_path: str
+    created_at: datetime
+    updated_at: datetime
+    error_message: Optional[str] = None
+
+    @staticmethod
+    def new(dataset_id: str, query: str, code: str, plot_path: str, name: str = "") -> "Analysis":
+        """Create a new analysis record."""
+        now = datetime.now()
+        return Analysis(
+            id=str(uuid4()),
+            dataset_id=dataset_id,
+            name=name or f"Analysis {now.strftime('%Y-%m-%d %H:%M')}",
+            query=query,
+            code=code,
+            plot_path=plot_path,
+            created_at=now,
+            updated_at=now,
+            error_message=None
+        )
 
 
 @dataclass

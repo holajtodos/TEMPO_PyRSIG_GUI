@@ -2,1414 +2,1686 @@
 
 ## Executive Summary
 
-Add a hybrid NL-to-chart system that uses **Gemini API as a query interpreter** (not chart generator) to translate natural language into structured parameters, then **Matplotlib generates publication-quality charts locally**. This preserves scientific reproducibility while adding user-friendly NL interface.
+Implement a **Natural Language Chart Generation** feature using **Google Gemini API** (direct, no PandasAI library). This feature will:
+
+1. Accept natural language queries from users (e.g., "Plot NO₂ trends at BV site by hour")
+2. Generate executable matplotlib code via Gemini
+3. Execute the code safely with user's DataFrame
+4. **Save both the code and the plot** for reproducibility
+5. Allow users to **edit the generated code** and re-run it
+
+**Key Principle:** Every plot must be reproducible - code is saved alongside the plot and can be modified.
+
+---
 
 ## Architecture Overview
 
 ```
-User NL Query ("Show NO₂ trends at BV during weekdays, cloud < 0.3")
+User Query: "Show NO₂ trends at BV during weekdays"
     ↓
-Gemini API (query parser) → Structured JSON parameters
+1. Load Dataset → Prepare DataFrame with schema
     ↓
-Local Parameter Validator (checks against DB)
-    ↓ (if ambiguous)
-Interactive Clarification Dialog
+2. Send Query + DataFrame Schema → Gemini API
     ↓
-Matplotlib Chart Generator (local, reproducible)
+3. Gemini Returns: Python Code (matplotlib + pandas)
     ↓
-Outputs: PNG/SVG chart + Python script + metadata JSON
+4. Execute Code in Safe Sandbox
+    ↓
+5. Capture: Plot PNG + Generated Code
+    ↓
+6. Save to Database: Analysis(query, code, plot_path, dataset_id)
+    ↓
+7. Display in UI: Code Editor (editable) + Plot Viewer
+    ↓
+8. User can Edit Code → Re-run → Update Analysis Record
 ```
 
-## Why This Hybrid Approach Works
+---
 
-### Addresses Scientific Requirements
-- **Reproducibility**: Matplotlib code saved alongside charts, can regenerate without AI
-- **Precision**: Full control over axes, scales, formatting via Matplotlib
-- **Data Privacy**: Only query text sent to API, not actual atmospheric data
-- **Performance**: Chart rendering is local and fast
-- **Offline Capability**: Saved scripts work without internet
+## Why Direct Gemini API (Not PandasAI)?
 
-### Adds User Value
-- **Natural language**: "Show diurnal NO₂ patterns at Bountiful for August weekdays"
-- **Smart interpretation**: Gemini maps "Bountiful" → site "BV", "August" → date range
-- **Guided refinement**: AI asks clarifying questions when ambiguous
-- **Discoverability**: Users don't need to learn complex UI
+### Advantages of This Approach
+- **Full Control**: We control exactly what code gets generated and executed
+- **Reproducibility**: Every plot has its source code saved
+- **Editability**: Users can modify generated code for fine-tuning
+- **Lightweight**: No heavy dependencies (just `google-generativeai`)
+- **Transparency**: Users see exactly what code runs on their data
+- **Cost Efficient**: Direct API calls, no middleware overhead
 
-## Critical Implementation Decisions
+### Trade-offs & Mitigations
+- **Code Execution Risk**: Executing LLM-generated code could be dangerous
+    - *Mitigation*: Sandboxed execution with restricted globals (no file I/O, no subprocess, only safe modules)
+- **Code Quality**: Gemini might generate suboptimal or incorrect code
+    - *Mitigation*: Users can edit and fix the code; save corrected versions
+- **Data Privacy**: DataFrame schema sent to Google
+    - *Mitigation*: Only column names/types sent, not actual data values
 
-### 1. Data Flow: Text Only to API ✓
-- **Send to Gemini**: Query text + available dataset/site metadata (IDs, names, date ranges)
-- **Never send**: Actual NO₂/HCHO measurements, NetCDF data, proprietary research data
-- **Gemini returns**: Structured JSON with chart parameters
+---
 
-### 2. Reproducibility: Save Everything ✓
-For each generated chart, save:
-```
-charts/
-  chart_20260115_143022/
-    chart.png              # Visual output
-    chart.svg              # Vector version
-    parameters.json        # Structured params from Gemini
-    generate_chart.py      # Matplotlib code to regenerate
-    query.txt              # Original NL query
-```
+## Implementation Details
 
-This allows:
-- Regenerating exact chart for publications
-- Debugging if chart looks wrong
-- Tweaking parameters manually
-- Sharing reproducible workflows
+### 1. Dependencies
 
-### 3. Gemini Output Schema
-Gemini must return strict JSON schema:
-```json
-{
-  "chart_type": "time_series | diurnal_cycle | correlation | distribution | comparison",
-  "datasets": [{"dataset_id": "uuid", "label": "August 2024"}],
-  "sites": [{"site_id": "BV", "name": "Bountiful"}],
-  "variables": ["NO2", "HCHO", "FNR"],
-  "date_range": {"start": "2024-08-01", "end": "2024-08-31"},
-  "filters": {
-    "days_of_week": [1,2,3,4,5],
-    "hours_utc": [14,15,16,17,18],
-    "cloud_fraction_max": 0.3,
-    "sza_max": 60
-  },
-  "aggregation": "hourly | daily | weekly",
-  "styling": {
-    "title": "NO₂ Trends at Bountiful (Weekdays, Low Cloud)",
-    "xlabel": "Date",
-    "ylabel": "NO₂ (molecules/cm²)"
-  },
-  "clarifications_needed": [] or ["Which aggregation: hourly or daily?"]
-}
+**Add to `requirements.txt`:**
+```txt
+google-generativeai>=0.8.0  # Gemini API client
+matplotlib>=3.8.0           # Already installed
+pandas>=2.1.0               # Already installed
+numpy>=1.24.0               # Already installed
 ```
 
-### 4. Error Handling & Clarifications
-When Gemini identifies ambiguities, return:
-```json
-{
-  "status": "needs_clarification",
-  "clarifications_needed": [
-    {
-      "question": "Which site did you mean?",
-      "options": ["BV (Bountiful, UT)", "HC (Herriman, UT)", "All sites"],
-      "context": "Found multiple sites in the selected region"
-    }
-  ]
-}
+**Installation:**
+```bash
+pip install google-generativeai
 ```
 
-UI shows interactive dialog, user selects, query re-sent with clarification.
+---
 
-## Implementation Plan
+### 2. Database Model - Analysis Storage
 
-### Phase 1: Core Infrastructure
+**File: `src/tempo_app/storage/models.py`**
 
-#### 1.1 Create Chart Generator Module
-**File**: `src/tempo_app/core/chart_generator.py`
+Add a new dataclass to store analysis results:
 
-Implement Matplotlib-based chart generation:
-- `TimeSeriesChart`: Plot variable(s) over time at specific sites
-- `DiurnalCycleChart`: Show hourly patterns (box plots or line plots by hour)
-- `CorrelationChart`: Scatter plots of var1 vs var2
-- `DistributionChart`: Histograms or KDE plots
-- `ComparisonChart`: Multi-site or multi-dataset overlays
-
-Each returns:
-- Chart image path (PNG/SVG)
-- Generated Python code (as string)
-- Metadata dict
-
-**Key Implementation Details**:
 ```python
-class ChartGenerator:
-    def __init__(self, output_dir: Path):
-        self.output_dir = output_dir
-
-    def generate_time_series(
-        self,
-        data: xr.Dataset,
-        variable: str,
-        sites: List[Site],
-        title: str,
-        **styling_kwargs
-    ) -> ChartResult:
-        """
-        Generate time series chart.
-
-        Returns:
-            ChartResult(
-                png_path=Path,
-                svg_path=Path,
-                script_code=str,  # Python code to regenerate
-                metadata=dict
-            )
-        """
-        fig, ax = plt.subplots(figsize=(12, 6))
-
-        # Plot data for each site
-        for site in sites:
-            site_data = data.sel(lat=site.lat, lon=site.lon, method='nearest')
-            ax.plot(site_data.time, site_data[variable], label=site.name)
-
-        # Styling
-        ax.set_title(title)
-        ax.set_xlabel('Date')
-        ax.set_ylabel(self._get_variable_label(variable))
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-
-        # Save outputs
-        chart_id = f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        chart_dir = self.output_dir / chart_id
-        chart_dir.mkdir(exist_ok=True)
-
-        png_path = chart_dir / "chart.png"
-        svg_path = chart_dir / "chart.svg"
-
-        fig.savefig(png_path, dpi=300, bbox_inches='tight')
-        fig.savefig(svg_path, format='svg', bbox_inches='tight')
-        plt.close(fig)
-
-        # Generate reproducible script
-        script_code = self._generate_script(
-            chart_type='time_series',
-            data_query=...,  # How to recreate data
-            plotting_code=...,  # Exact plotting commands
-        )
-
-        script_path = chart_dir / "generate_chart.py"
-        script_path.write_text(script_code)
-
-        return ChartResult(
-            png_path=png_path,
-            svg_path=svg_path,
-            script_path=script_path,
-            script_code=script_code,
-            metadata={
-                'chart_id': chart_id,
-                'chart_type': 'time_series',
-                'variable': variable,
-                'sites': [s.id for s in sites],
-                'created_at': datetime.now().isoformat()
-            }
-        )
-
-    def _generate_script(self, chart_type, data_query, plotting_code):
-        """Generate standalone Python script that recreates chart."""
-        return f"""
-#!/usr/bin/env python3
-\"\"\"
-Auto-generated script to reproduce chart.
-Generated at: {datetime.now().isoformat()}
-Chart type: {chart_type}
-\"\"\"
-
-import matplotlib.pyplot as plt
-import xarray as xr
-from pathlib import Path
-
-# Load data
-{data_query}
-
-# Generate chart
-{plotting_code}
-
-# Save
-plt.savefig('chart_regenerated.png', dpi=300, bbox_inches='tight')
-plt.savefig('chart_regenerated.svg', format='svg', bbox_inches='tight')
-print("Chart regenerated successfully")
-"""
-```
-
-#### 1.2 Create Gemini Query Interpreter
-**File**: `src/tempo_app/integrations/gemini_client.py`
-
-Responsibilities:
-- Send NL query + context (available datasets, sites) to Gemini
-- Parse JSON response
-- Handle API errors (rate limits, network issues)
-- Validate response schema
-- Return structured parameters or clarification requests
-
-**Implementation**:
-```python
-import google.generativeai as genai
-from typing import Dict, List, Optional
-import json
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from uuid import UUID, uuid4
 
 @dataclass
-class ChartParameters:
-    chart_type: str
-    datasets: List[Dict]
-    sites: List[Dict]
-    variables: List[str]
-    date_range: Dict
-    filters: Dict
-    aggregation: str
-    styling: Dict
-    clarifications_needed: List[Dict]
+class Analysis:
+    """
+    Stores a saved chart analysis with its code.
 
-class GeminiQueryInterpreter:
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash-exp"):
+    Attributes:
+        id: Unique identifier
+        dataset_id: Which dataset this analysis uses
+        name: User-friendly name (e.g., "NO₂ Hourly Trends")
+        query: Original natural language query
+        code: Generated matplotlib code (editable)
+        plot_path: Path to saved PNG file
+        created_at: When first generated
+        updated_at: When code was last edited/re-run
+        error_message: If execution failed, store error here
+    """
+    id: UUID
+    dataset_id: UUID
+    name: str
+    query: str
+    code: str
+    plot_path: str
+    created_at: datetime
+    updated_at: datetime
+    error_message: str | None = None
+
+    @staticmethod
+    def new(dataset_id: UUID, query: str, code: str, plot_path: str, name: str = "") -> "Analysis":
+        """Create a new analysis record."""
+        now = datetime.now()
+        return Analysis(
+            id=uuid4(),
+            dataset_id=dataset_id,
+            name=name or f"Analysis {now.strftime('%Y-%m-%d %H:%M')}",
+            query=query,
+            code=code,
+            plot_path=plot_path,
+            created_at=now,
+            updated_at=now,
+            error_message=None
+        )
+```
+
+**Database Schema (SQLite):**
+
+```sql
+CREATE TABLE IF NOT EXISTS analyses (
+    id TEXT PRIMARY KEY,
+    dataset_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    query TEXT NOT NULL,
+    code TEXT NOT NULL,
+    plot_path TEXT NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    error_message TEXT,
+    FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_analyses_dataset ON analyses(dataset_id);
+CREATE INDEX idx_analyses_created ON analyses(created_at DESC);
+```
+
+**Add to `src/tempo_app/storage/database.py`:**
+
+```python
+class DatabaseManager:
+    # ... existing methods ...
+
+    def save_analysis(self, analysis: Analysis) -> None:
+        """Save or update an analysis record."""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO analyses
+                (id, dataset_id, name, query, code, plot_path, created_at, updated_at, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(analysis.id),
+                str(analysis.dataset_id),
+                analysis.name,
+                analysis.query,
+                analysis.code,
+                analysis.plot_path,
+                analysis.created_at,
+                analysis.updated_at,
+                analysis.error_message
+            ))
+            conn.commit()
+
+    def get_analyses_for_dataset(self, dataset_id: UUID) -> list[Analysis]:
+        """Retrieve all analyses for a dataset, newest first."""
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT id, dataset_id, name, query, code, plot_path,
+                       created_at, updated_at, error_message
+                FROM analyses
+                WHERE dataset_id = ?
+                ORDER BY created_at DESC
+            """, (str(dataset_id),)).fetchall()
+
+            return [Analysis(
+                id=UUID(row[0]),
+                dataset_id=UUID(row[1]),
+                name=row[2],
+                query=row[3],
+                code=row[4],
+                plot_path=row[5],
+                created_at=row[6],
+                updated_at=row[7],
+                error_message=row[8]
+            ) for row in rows]
+
+    def get_analysis(self, analysis_id: UUID) -> Analysis | None:
+        """Retrieve a specific analysis by ID."""
+        with self._get_connection() as conn:
+            row = conn.execute("""
+                SELECT id, dataset_id, name, query, code, plot_path,
+                       created_at, updated_at, error_message
+                FROM analyses
+                WHERE id = ?
+            """, (str(analysis_id),)).fetchone()
+
+            if not row:
+                return None
+
+            return Analysis(
+                id=UUID(row[0]),
+                dataset_id=UUID(row[1]),
+                name=row[2],
+                query=row[3],
+                code=row[4],
+                plot_path=row[5],
+                created_at=row[6],
+                updated_at=row[7],
+                error_message=row[8]
+            )
+
+    def delete_analysis(self, analysis_id: UUID) -> None:
+        """Delete an analysis and its plot file."""
+        analysis = self.get_analysis(analysis_id)
+        if analysis:
+            # Delete plot file
+            plot_path = Path(analysis.plot_path)
+            if plot_path.exists():
+                plot_path.unlink()
+
+            # Delete DB record
+            with self._get_connection() as conn:
+                conn.execute("DELETE FROM analyses WHERE id = ?", (str(analysis_id),))
+                conn.commit()
+```
+
+---
+
+### 3. Configuration - Gemini API Key
+
+**File: `src/tempo_app/core/config.py`**
+
+Add Gemini API key to the default config:
+
+```python
+DEFAULT_CONFIG = {
+    "data_dir": None,              # Custom data storage location
+    "font_scale": 1.0,             # UI font scaling (0.8-1.5)
+    "theme_mode": "light",         # Reserved for future
+    "download_workers": 8,         # Parallel download threads
+    "rsig_api_key": "",            # NASA RSIG API key (optional)
+    "gemini_api_key": "",          # Google Gemini API key for AI analysis
+}
+```
+
+No other changes needed - the existing `ConfigManager` class handles get/set automatically.
+
+---
+
+### 4. Core Service - Chart Code Generator
+
+**File: `src/tempo_app/core/chart_generator.py` (NEW FILE)**
+
+This is the heart of the system - handles Gemini API communication and code execution.
+
+```python
+"""
+Chart code generator using Google Gemini API.
+
+This module generates matplotlib code from natural language queries
+and executes it safely in a sandboxed environment.
+"""
+
+import io
+import traceback
+from pathlib import Path
+from typing import Any
+
+import google.generativeai as genai
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from tempo_app.core.config import ConfigManager
+
+# Use non-interactive backend for server-side rendering
+matplotlib.use('Agg')
+
+
+class ChartGenerationError(Exception):
+    """Raised when chart code generation or execution fails."""
+    pass
+
+
+class ChartGenerator:
+    """
+    Generates and executes matplotlib code using Google Gemini API.
+
+    Usage:
+        generator = ChartGenerator()
+        code = generator.generate_code(
+            query="Plot NO2 trends by hour",
+            df_schema={"columns": [...], "dtypes": {...}}
+        )
+        plot_path = generator.execute_code(code, df)
+    """
+
+    def __init__(self):
+        """Initialize the chart generator with Gemini API."""
+        self.config = ConfigManager()
+        self._setup_gemini()
+
+    def _setup_gemini(self) -> None:
+        """Configure Gemini API with user's key."""
+        api_key = self.config.get("gemini_api_key")
+
+        if not api_key:
+            raise ChartGenerationError(
+                "Gemini API key not configured. "
+                "Please add your API key in Settings."
+            )
+
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model)
-        self.cache = {}  # Query cache to reduce API calls
 
-    def interpret_query(
+        # Use gemini-1.5-flash for speed and cost efficiency
+        # Alternative: gemini-1.5-pro for better quality
+        self.model = genai.GenerativeModel('gemini-1.5-flash')
+
+    def generate_code(
         self,
         query: str,
-        context: Dict
-    ) -> ChartParameters:
+        df_schema: dict[str, Any]
+    ) -> str:
         """
-        Interpret natural language query into structured parameters.
+        Generate matplotlib code from a natural language query.
 
         Args:
-            query: User's natural language query
-            context: Available datasets, sites, variables
+            query: Natural language description (e.g., "Plot NO2 by hour")
+            df_schema: DataFrame structure info
+                {
+                    "columns": ["TIME", "NO2_TropVCD", "site_code", ...],
+                    "dtypes": {"TIME": "datetime64[ns]", "NO2_TropVCD": "float64", ...},
+                    "shape": (1000, 8),
+                    "sample_values": {"site_code": ["BV", "LA", "BA"], ...}
+                }
 
         Returns:
-            ChartParameters with parsed values or clarifications needed
+            Python code string that generates a matplotlib chart
+
+        Raises:
+            ChartGenerationError: If API call fails or response is invalid
         """
-        # Check cache
-        cache_key = f"{query}:{hash(json.dumps(context, sort_keys=True))}"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
 
-        # Build prompt
-        system_prompt = self._build_system_prompt()
-        user_prompt = self._build_user_prompt(query, context)
+        # Build the prompt for Gemini
+        prompt = self._build_prompt(query, df_schema)
 
-        # Call Gemini
         try:
-            response = self.model.generate_content(
-                f"{system_prompt}\n\n{user_prompt}",
-                generation_config={
-                    'temperature': 0.1,  # Low temp for consistency
-                    'response_mime_type': 'application/json'
-                }
-            )
+            # Call Gemini API
+            response = self.model.generate_content(prompt)
 
-            # Parse response
-            params_dict = json.loads(response.text)
-            params = ChartParameters(**params_dict)
+            if not response.text:
+                raise ChartGenerationError("Gemini returned empty response")
 
-            # Cache result
-            self.cache[cache_key] = params
+            # Extract code from response (remove markdown formatting if present)
+            code = self._extract_code(response.text)
 
-            return params
+            return code
 
         except Exception as e:
-            # Handle API errors
-            return ChartParameters(
-                chart_type='error',
-                clarifications_needed=[{
-                    'question': f'Error interpreting query: {str(e)}',
-                    'options': ['Try rephrasing your request'],
-                    'context': 'API error'
-                }]
-            )
+            raise ChartGenerationError(f"Failed to generate code: {str(e)}")
 
-    def _build_system_prompt(self) -> str:
-        return """You are a query interpreter for a NASA TEMPO atmospheric data analyzer.
-Parse natural language chart requests into structured JSON parameters.
+    def _build_prompt(self, query: str, df_schema: dict[str, Any]) -> str:
+        """
+        Construct the prompt for Gemini.
 
-Available chart types:
-- time_series: Plot variable(s) over time
-- diurnal_cycle: Show patterns by hour of day (0-23 UTC)
-- correlation: Scatter plot of two variables
-- distribution: Histogram of variable values
-- comparison: Overlay multiple sites/datasets
+        This is the critical part - a well-crafted prompt ensures good code.
+        """
 
-Variables:
-- NO2: Nitrogen dioxide tropospheric column (molecules/cm²)
-- HCHO: Formaldehyde total column (molecules/cm²)
-- FNR: Formaldehyde-to-NO₂ ratio
+        columns_str = ", ".join(df_schema["columns"])
+        dtypes_str = "\n".join([f"  - {col}: {dtype}"
+                                for col, dtype in df_schema["dtypes"].items()])
 
-CRITICAL RULES:
-1. Only use provided dataset/site IDs from context
-2. If query is ambiguous, populate clarifications_needed array
-3. Return valid JSON only, no explanatory text
-4. If request is impossible, explain in clarifications_needed
-5. Preserve scientific terminology and units
-6. For date ranges, infer from context if not specified
-7. Map informal names to formal IDs (e.g., "Bountiful" → site ID "BV")
+        # Include sample values for categorical columns
+        samples_str = ""
+        if "sample_values" in df_schema:
+            samples_str = "\nSample categorical values:\n" + "\n".join([
+                f"  - {col}: {values}"
+                for col, values in df_schema["sample_values"].items()
+            ])
 
-Return JSON following this exact schema:
-{
-  "chart_type": "time_series | diurnal_cycle | correlation | distribution | comparison",
-  "datasets": [{"dataset_id": "uuid", "label": "August 2024"}],
-  "sites": [{"site_id": "BV", "name": "Bountiful"}],
-  "variables": ["NO2"],
-  "date_range": {"start": "2024-08-01", "end": "2024-08-31"},
-  "filters": {
-    "days_of_week": [0,1,2,3,4,5,6],  # 0=Monday
-    "hours_utc": [0-23],
-    "cloud_fraction_max": 1.0,
-    "sza_max": 90
-  },
-  "aggregation": "hourly | daily | weekly",
-  "styling": {
-    "title": "Chart Title",
-    "xlabel": "X Label",
-    "ylabel": "Y Label"
-  },
-  "clarifications_needed": []
-}
+        prompt = f"""You are a data visualization expert. Generate Python code using matplotlib and pandas to create a chart.
+
+DATASET INFORMATION:
+- Available DataFrame: `df` (already loaded in memory)
+- Columns: {columns_str}
+- Data types:
+{dtypes_str}
+- Shape: {df_schema.get('shape', 'Unknown')} rows
+{samples_str}
+
+USER REQUEST:
+{query}
+
+REQUIREMENTS:
+1. Use ONLY these imports (already available):
+   - pandas as pd
+   - numpy as np
+   - matplotlib.pyplot as plt
+
+2. The DataFrame `df` is already loaded - DO NOT load data
+
+3. Generate a single matplotlib chart
+
+4. MUST save the figure using:
+   plt.savefig('OUTPUT_PATH', dpi=150, bbox_inches='tight')
+
+5. Include proper:
+   - Title (clear and descriptive)
+   - Axis labels with units
+   - Legend (if multiple series)
+   - Grid (if appropriate)
+
+6. Use appropriate chart type:
+   - Time series → Line plot
+   - Comparisons → Bar chart
+   - Distributions → Histogram or box plot
+   - Correlations → Scatter plot
+
+7. Handle missing data appropriately (dropna or fillna)
+
+8. Set figure size for readability: plt.figure(figsize=(10, 6))
+
+9. DO NOT use plt.show() - only plt.savefig()
+
+10. Return ONLY executable Python code - no explanations, no markdown
+
+EXAMPLE OUTPUT FORMAT:
+import matplotlib.pyplot as plt
+import pandas as pd
+
+# Filter data for specific site
+df_filtered = df[df['site_code'] == 'BV']
+
+# Group by hour and calculate mean
+hourly_mean = df_filtered.groupby(df_filtered['TIME'].dt.hour)['NO2_TropVCD'].mean()
+
+# Create plot
+plt.figure(figsize=(10, 6))
+plt.plot(hourly_mean.index, hourly_mean.values, marker='o', linewidth=2)
+plt.xlabel('Hour of Day')
+plt.ylabel('NO₂ Tropospheric VCD (molecules/cm²)')
+plt.title('Average NO₂ Levels by Hour at BV Site')
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('OUTPUT_PATH', dpi=150, bbox_inches='tight')
+plt.close()
+
+Now generate code for the user's request above.
 """
+        return prompt
 
-    def _build_user_prompt(self, query: str, context: Dict) -> str:
-        return f"""Available Context:
-{json.dumps(context, indent=2)}
+    def _extract_code(self, response_text: str) -> str:
+        """
+        Extract Python code from Gemini's response.
 
-User Query: "{query}"
+        Gemini might wrap code in markdown:
+        ```python
+        code here
+        ```
 
-Parse this query and return structured JSON parameters."""
-```
+        This function strips the markdown and returns clean code.
+        """
 
-#### 1.3 Create Parameter Validator
-**File**: `src/tempo_app/core/chart_validator.py`
+        # Remove markdown code blocks
+        if "```python" in response_text:
+            # Extract content between ```python and ```
+            start = response_text.find("```python") + len("```python")
+            end = response_text.find("```", start)
+            code = response_text[start:end].strip()
+        elif "```" in response_text:
+            # Generic code block
+            start = response_text.find("```") + len("```")
+            end = response_text.find("```", start)
+            code = response_text[start:end].strip()
+        else:
+            # No markdown, use as-is
+            code = response_text.strip()
 
-Validates Gemini output against actual database:
-```python
-from dataclasses import dataclass
-from typing import List, Optional
-from src.tempo_app.storage.models import Dataset, Site
-from src.tempo_app.integrations.gemini_client import ChartParameters
+        return code
 
-@dataclass
-class ValidationResult:
-    is_valid: bool
-    errors: List[str]
-    warnings: List[str]
+    def execute_code(
+        self,
+        code: str,
+        df: pd.DataFrame,
+        output_path: Path
+    ) -> Path:
+        """
+        Execute generated code in a safe sandbox.
 
-class ChartParameterValidator:
-    def __init__(self, db_session):
-        self.db = db_session
+        Args:
+            code: Python code to execute
+            df: DataFrame to make available to the code
+            output_path: Where to save the plot
 
-    def validate(self, params: ChartParameters) -> ValidationResult:
-        """Validate parameters against database."""
-        errors = []
-        warnings = []
+        Returns:
+            Path to the generated plot
 
-        # Validate chart type
-        valid_types = ['time_series', 'diurnal_cycle', 'correlation',
-                       'distribution', 'comparison']
-        if params.chart_type not in valid_types:
-            errors.append(f"Invalid chart type: {params.chart_type}")
+        Raises:
+            ChartGenerationError: If execution fails
+        """
 
-        # Validate datasets exist
-        for ds in params.datasets:
-            dataset = self.db.query(Dataset).filter_by(
-                id=ds['dataset_id']
-            ).first()
-            if not dataset:
-                errors.append(f"Dataset not found: {ds['dataset_id']}")
-            else:
-                # Check date range is within dataset bounds
-                if params.date_range:
-                    start = params.date_range.get('start')
-                    end = params.date_range.get('end')
-                    if start < dataset.start_date or end > dataset.end_date:
-                        warnings.append(
-                            f"Date range extends beyond dataset coverage"
-                        )
+        # Replace OUTPUT_PATH placeholder with actual path
+        code = code.replace("'OUTPUT_PATH'", f"'{output_path}'")
+        code = code.replace('"OUTPUT_PATH"', f'"{output_path}"')
 
-        # Validate sites exist
-        for site in params.sites:
-            s = self.db.query(Site).filter_by(id=site['site_id']).first()
-            if not s:
-                errors.append(f"Site not found: {site['site_id']}")
+        # Create safe execution environment
+        safe_globals = {
+            # Data libraries
+            'pd': pd,
+            'np': np,
+            'plt': plt,
 
-        # Validate variables
-        valid_vars = ['NO2', 'HCHO', 'FNR']
-        for var in params.variables:
-            if var not in valid_vars:
-                errors.append(f"Invalid variable: {var}")
+            # User's data
+            'df': df,
 
-        # Chart-specific validation
-        if params.chart_type == 'correlation' and len(params.variables) != 2:
-            errors.append("Correlation charts require exactly 2 variables")
-
-        return ValidationResult(
-            is_valid=len(errors) == 0,
-            errors=errors,
-            warnings=warnings
-        )
-```
-
-### Phase 2: Storage & History
-
-#### 2.1 Database Schema Updates
-Add to `src/tempo_app/storage/models.py`:
-
-```python
-from sqlalchemy import Column, String, DateTime, JSON, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
-import uuid
-from datetime import datetime
-
-class GeneratedChart(Base):
-    __tablename__ = 'generated_charts'
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    dataset_id = Column(UUID(as_uuid=True), ForeignKey('datasets.id'))
-
-    # Original query
-    query_text = Column(String, nullable=False)
-
-    # Chart configuration
-    chart_type = Column(String, nullable=False)
-    parameters_json = Column(JSON, nullable=False)  # Full Gemini output
-
-    # File paths (relative to charts directory)
-    image_path = Column(String, nullable=False)  # PNG
-    svg_path = Column(String)
-    script_path = Column(String, nullable=False)  # .py file
-
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    regenerated_from = Column(UUID(as_uuid=True), ForeignKey('generated_charts.id'), nullable=True)
-
-    # Relationships
-    dataset = relationship('Dataset', back_populates='charts')
-    original_chart = relationship('GeneratedChart', remote_side=[id])
-
-# Add to Dataset model
-Dataset.charts = relationship('GeneratedChart', back_populates='dataset')
-```
-
-#### 2.2 Migration Script
-Create Alembic migration:
-```bash
-alembic revision -m "add_generated_charts_table"
-```
-
-### Phase 3: UI Integration
-
-#### 3.1 New Charts Page
-**File**: `src/tempo_app/ui/pages/charts.py`
-
-```python
-import flet as ft
-from src.tempo_app.integrations.gemini_client import GeminiQueryInterpreter
-from src.tempo_app.core.chart_validator import ChartParameterValidator
-from src.tempo_app.core.chart_generator import ChartGenerator
-
-class ChartsPage:
-    def __init__(self, page: ft.Page, db_session):
-        self.page = page
-        self.db = db_session
-        self.gemini = GeminiQueryInterpreter(api_key=self._get_api_key())
-        self.validator = ChartParameterValidator(db_session)
-        self.generator = ChartGenerator(output_dir=Path('charts'))
-
-        self.query_input = ft.TextField(
-            label="Describe the chart you want...",
-            multiline=True,
-            min_lines=3,
-            max_lines=5,
-            hint_text="Example: Show NO₂ trends at Bountiful for August weekdays",
-            expand=True
-        )
-
-        self.submit_btn = ft.ElevatedButton(
-            "Generate Chart",
-            on_click=self.on_generate_click,
-            icon=ft.icons.AUTO_GRAPH
-        )
-
-        self.loading = ft.ProgressRing(visible=False)
-        self.status_text = ft.Text("", size=14)
-
-        self.chart_display = ft.Container(
-            content=ft.Text("Your chart will appear here"),
-            bgcolor=ft.colors.SURFACE_VARIANT,
-            border_radius=8,
-            padding=20,
-            expand=True
-        )
-
-        self.examples = self._build_examples()
-        self.history = self._build_history_sidebar()
-
-    async def on_generate_click(self, e):
-        """Handle chart generation."""
-        query = self.query_input.value
-        if not query:
-            self.status_text.value = "Please enter a query"
-            await self.page.update_async()
-            return
-
-        # Show loading state
-        self.loading.visible = True
-        self.submit_btn.disabled = True
-        self.status_text.value = "Interpreting your request..."
-        await self.page.update_async()
+            # Disable dangerous builtins
+            '__builtins__': {
+                # Allow only safe built-ins
+                'len': len,
+                'range': range,
+                'enumerate': enumerate,
+                'zip': zip,
+                'sum': sum,
+                'min': min,
+                'max': max,
+                'abs': abs,
+                'round': round,
+                'sorted': sorted,
+                'list': list,
+                'dict': dict,
+                'set': set,
+                'tuple': tuple,
+                'str': str,
+                'int': int,
+                'float': float,
+                'bool': bool,
+                'print': print,  # Allow for debugging
+            }
+        }
 
         try:
-            # Get context from database
-            context = self._build_context()
+            # Execute the code
+            exec(code, safe_globals)
 
-            # Interpret query with Gemini
-            params = await self._async_interpret(query, context)
-
-            # Check for clarifications
-            if params.clarifications_needed:
-                await self._show_clarification_dialog(params)
-                return
-
-            # Validate parameters
-            self.status_text.value = "Validating parameters..."
-            await self.page.update_async()
-
-            validation = self.validator.validate(params)
-            if not validation.is_valid:
-                self.status_text.value = "Errors: " + "; ".join(validation.errors)
-                return
-
-            # Generate chart
-            self.status_text.value = "Generating chart..."
-            await self.page.update_async()
-
-            chart_result = await self._async_generate_chart(params)
-
-            # Display chart
-            await self._display_chart(chart_result)
-
-            # Save to database
-            self._save_chart_to_db(query, params, chart_result)
-
-            self.status_text.value = "Chart generated successfully!"
-
-        except Exception as ex:
-            self.status_text.value = f"Error: {str(ex)}"
-
-        finally:
-            self.loading.visible = False
-            self.submit_btn.disabled = False
-            await self.page.update_async()
-
-    async def _show_clarification_dialog(self, params):
-        """Show interactive dialog for clarifications."""
-        # Build dialog with questions
-        questions = []
-        for clarification in params.clarifications_needed:
-            question_text = ft.Text(clarification['question'], weight=ft.FontWeight.BOLD)
-            options = ft.RadioGroup(
-                content=ft.Column([
-                    ft.Radio(value=opt, label=opt)
-                    for opt in clarification['options']
-                ])
-            )
-            questions.append(ft.Column([question_text, options]))
-
-        dialog = ft.AlertDialog(
-            title=ft.Text("Need More Information"),
-            content=ft.Column(questions, tight=True, scroll=ft.ScrollMode.AUTO),
-            actions=[
-                ft.TextButton("Cancel", on_click=lambda e: self._close_dialog()),
-                ft.TextButton("Submit", on_click=lambda e: self._resubmit_with_clarifications())
-            ]
-        )
-
-        self.page.dialog = dialog
-        dialog.open = True
-        await self.page.update_async()
-
-    def _build_examples(self):
-        """Build example queries panel."""
-        examples = [
-            "Show NO₂ time series at Bountiful for August 2024",
-            "Compare weekday vs weekend HCHO patterns at all sites",
-            "Plot NO₂ vs HCHO correlation when cloud fraction < 0.2",
-            "Show diurnal cycles for FNR during summer weekends",
-            "Distribution of NO₂ values at BV site for rush hours (6-9am, 4-7pm)"
-        ]
-
-        return ft.ExpansionTile(
-            title=ft.Text("Example Queries"),
-            subtitle=ft.Text("Click to use"),
-            controls=[
-                ft.ListTile(
-                    title=ft.Text(ex),
-                    on_click=lambda e, example=ex: self._use_example(example)
+            # Verify plot was created
+            if not output_path.exists():
+                raise ChartGenerationError(
+                    "Code executed but no plot file was created. "
+                    "Make sure code includes plt.savefig()"
                 )
-                for ex in examples
-            ]
-        )
 
-    def _build_history_sidebar(self):
-        """Build chart history sidebar."""
-        # Load recent charts from database
-        recent_charts = self.db.query(GeneratedChart).order_by(
-            GeneratedChart.created_at.desc()
-        ).limit(10).all()
+            return output_path
 
-        return ft.Container(
-            width=250,
-            content=ft.Column([
-                ft.Text("Recent Charts", size=18, weight=ft.FontWeight.BOLD),
-                ft.Divider(),
-                *[
-                    ft.ListTile(
-                        title=ft.Text(chart.query_text, max_lines=2),
-                        subtitle=ft.Text(chart.created_at.strftime("%Y-%m-%d %H:%M")),
-                        on_click=lambda e, c=chart: self._load_chart(c)
-                    )
-                    for chart in recent_charts
-                ]
-            ], scroll=ft.ScrollMode.AUTO),
-            bgcolor=ft.colors.SURFACE_VARIANT,
-            padding=10
-        )
+        except Exception as e:
+            # Capture full traceback for debugging
+            error_details = traceback.format_exc()
+            raise ChartGenerationError(
+                f"Code execution failed:\n{error_details}"
+            )
 
-    def build(self):
-        """Build the page layout."""
-        return ft.Row([
-            # Main content
-            ft.Container(
-                content=ft.Column([
-                    ft.Text("Chart Generation", size=24, weight=ft.FontWeight.BOLD),
-                    self.examples,
-                    ft.Row([
-                        self.query_input,
-                        ft.Column([
-                            self.submit_btn,
-                            self.loading
-                        ])
-                    ]),
-                    self.status_text,
-                    self.chart_display
-                ], expand=True, scroll=ft.ScrollMode.AUTO),
-                expand=True,
-                padding=20
-            ),
-            # History sidebar
-            self.history
-        ], expand=True)
+    def get_dataframe_schema(self, df: pd.DataFrame) -> dict[str, Any]:
+        """
+        Extract schema information from a DataFrame.
+
+        This is sent to Gemini so it understands the data structure.
+
+        Args:
+            df: The DataFrame to analyze
+
+        Returns:
+            Schema dictionary with columns, types, and sample values
+        """
+
+        schema = {
+            "columns": df.columns.tolist(),
+            "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+            "shape": df.shape,
+            "sample_values": {}
+        }
+
+        # For categorical columns, provide sample unique values
+        for col in df.columns:
+            if df[col].dtype == 'object' or df[col].dtype.name == 'category':
+                unique_vals = df[col].dropna().unique()
+                if len(unique_vals) <= 20:  # Only if reasonable number
+                    schema["sample_values"][col] = unique_vals.tolist()[:10]
+
+        return schema
 ```
 
-#### 3.2 Clarification Dialog Component
-**File**: `src/tempo_app/ui/components/clarification_dialog.py`
+---
+
+### 5. Data Preparation - DataFrame Converter
+
+**File: `src/tempo_app/core/df_converter.py` (NEW FILE)**
+
+Convert xarray Datasets to pandas DataFrames optimized for AI analysis.
 
 ```python
-import flet as ft
-from typing import List, Dict, Callable
+"""
+Converts TEMPO xarray Datasets to pandas DataFrames for AI analysis.
 
-class ClarificationDialog:
-    def __init__(self, clarifications: List[Dict], on_submit: Callable):
-        self.clarifications = clarifications
-        self.on_submit = on_submit
-        self.selections = {}
+Flattens multi-dimensional data (TIME, LAT, LON) into a tabular format.
+"""
 
-    def build(self) -> ft.AlertDialog:
-        """Build interactive clarification dialog."""
-        question_controls = []
-
-        for idx, clarification in enumerate(self.clarifications):
-            question_text = ft.Text(
-                clarification['question'],
-                size=16,
-                weight=ft.FontWeight.BOLD
-            )
-
-            context = ft.Text(
-                clarification.get('context', ''),
-                size=12,
-                color=ft.colors.SECONDARY
-            )
-
-            # Radio group for options
-            radio_group = ft.RadioGroup(
-                content=ft.Column([
-                    ft.Radio(value=opt, label=opt)
-                    for opt in clarification['options']
-                ]),
-                on_change=lambda e, i=idx: self._on_selection(i, e.control.value)
-            )
-
-            question_controls.append(
-                ft.Container(
-                    content=ft.Column([
-                        question_text,
-                        context,
-                        radio_group
-                    ]),
-                    padding=10,
-                    border=ft.border.all(1, ft.colors.OUTLINE),
-                    border_radius=8,
-                    margin=ft.margin.only(bottom=10)
-                )
-            )
-
-        return ft.AlertDialog(
-            title=ft.Text("Need More Information"),
-            content=ft.Container(
-                content=ft.Column(
-                    question_controls,
-                    tight=True,
-                    scroll=ft.ScrollMode.AUTO
-                ),
-                width=500,
-                height=400
-            ),
-            actions=[
-                ft.TextButton("Cancel", on_click=lambda e: self._on_cancel()),
-                ft.ElevatedButton(
-                    "Submit",
-                    on_click=lambda e: self.on_submit(self.selections),
-                    disabled=len(self.selections) < len(self.clarifications)
-                )
-            ]
-        )
-
-    def _on_selection(self, question_idx: int, value: str):
-        self.selections[question_idx] = value
-```
-
-#### 3.3 Chart Display Component
-**File**: `src/tempo_app/ui/components/chart_display.py`
-
-```python
-import flet as ft
+import pandas as pd
+import xarray as xr
 from pathlib import Path
 
-class ChartDisplay:
-    def __init__(self, chart_result):
-        self.chart = chart_result
 
-    def build(self) -> ft.Container:
-        """Build chart display with controls."""
-        return ft.Container(
-            content=ft.Column([
-                # Chart image
-                ft.Image(
-                    src=str(self.chart.png_path),
-                    fit=ft.ImageFit.CONTAIN,
-                    expand=True
-                ),
+class DataFrameConverter:
+    """
+    Converts TEMPO NetCDF datasets to pandas DataFrames.
 
-                # Controls
-                ft.Row([
-                    ft.IconButton(
-                        icon=ft.icons.DOWNLOAD,
-                        tooltip="Download PNG",
-                        on_click=lambda e: self._download(self.chart.png_path)
-                    ),
-                    ft.IconButton(
-                        icon=ft.icons.DOWNLOAD_OUTLINED,
-                        tooltip="Download SVG",
-                        on_click=lambda e: self._download(self.chart.svg_path)
-                    ),
-                    ft.IconButton(
-                        icon=ft.icons.CODE,
-                        tooltip="View Generated Code",
-                        on_click=lambda e: self._show_code_dialog()
-                    ),
-                    ft.IconButton(
-                        icon=ft.icons.REFRESH,
-                        tooltip="Regenerate from Script",
-                        on_click=lambda e: self._regenerate()
-                    )
-                ], alignment=ft.MainAxisAlignment.CENTER),
+    The conversion flattens the 3D structure (TIME, LAT, LON) into rows,
+    making it suitable for pandas/matplotlib operations.
+    """
 
-                # Metadata
-                ft.ExpansionTile(
-                    title=ft.Text("Chart Parameters"),
-                    controls=[
-                        ft.Text(f"Chart Type: {self.chart.metadata['chart_type']}"),
-                        ft.Text(f"Variable(s): {', '.join(self.chart.metadata.get('variables', []))}"),
-                        ft.Text(f"Site(s): {', '.join(self.chart.metadata.get('sites', []))}"),
-                        ft.Text(f"Created: {self.chart.metadata['created_at']}")
-                    ]
-                )
-            ]),
-            border_radius=8,
-            padding=10
-        )
-
-    def _show_code_dialog(self):
-        """Show generated Python code in dialog."""
-        # Implementation...
-        pass
-```
-
-### Phase 4: Gemini API Integration
-
-#### 4.1 Configuration
-Add to `src/tempo_app/config.py`:
-
-```python
-from pydantic import BaseSettings
-from typing import Optional
-
-class Settings(BaseSettings):
-    # Existing settings...
-
-    # Gemini API settings
-    gemini_api_key: Optional[str] = None
-    gemini_model: str = "gemini-2.0-flash-exp"
-    gemini_timeout: int = 30  # seconds
-    enable_nl_charts: bool = True
-    gemini_cache_ttl: int = 3600  # 1 hour
-    gemini_max_queries_per_hour: int = 100
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
-
-settings = Settings()
-```
-
-Create `.env.example`:
-```bash
-# Gemini API Configuration
-GEMINI_API_KEY=your_api_key_here
-GEMINI_MODEL=gemini-2.0-flash-exp
-ENABLE_NL_CHARTS=true
-```
-
-#### 4.2 Rate Limiting & Caching
-**File**: `src/tempo_app/integrations/rate_limiter.py`
-
-```python
-from collections import deque
-from datetime import datetime, timedelta
-from typing import Optional
-
-class RateLimiter:
-    def __init__(self, max_requests: int, time_window: int):
+    @staticmethod
+    def dataset_to_dataframe(
+        dataset_path: Path,
+        include_coords: bool = True,
+        downsample: int | None = None
+    ) -> pd.DataFrame:
         """
+        Convert a TEMPO dataset to a pandas DataFrame.
+
         Args:
-            max_requests: Maximum requests allowed
-            time_window: Time window in seconds
+            dataset_path: Path to the NetCDF file
+            include_coords: Whether to include LAT/LON columns
+            downsample: If set, take every Nth point to reduce size
+
+        Returns:
+            DataFrame with columns:
+                - TIME (datetime)
+                - NO2_TropVCD (float)
+                - HCHO_TotVCD (float)
+                - FNR (float, if available)
+                - LAT (float, if include_coords=True)
+                - LON (float, if include_coords=True)
+
+        Example:
+            df = DataFrameConverter.dataset_to_dataframe(
+                Path("dataset.nc"),
+                downsample=10  # Take every 10th point
+            )
         """
-        self.max_requests = max_requests
-        self.time_window = time_window
-        self.requests = deque()
 
-    def can_make_request(self) -> bool:
-        """Check if request is allowed under rate limit."""
-        now = datetime.now()
-        cutoff = now - timedelta(seconds=self.time_window)
+        # Load xarray dataset
+        ds = xr.open_dataset(dataset_path)
 
-        # Remove old requests
-        while self.requests and self.requests[0] < cutoff:
-            self.requests.popleft()
+        # Convert to DataFrame
+        df = ds.to_dataframe().reset_index()
 
-        return len(self.requests) < self.max_requests
+        # Apply downsampling if requested
+        if downsample and downsample > 1:
+            df = df.iloc[::downsample]
 
-    def record_request(self):
-        """Record a new request."""
-        self.requests.append(datetime.now())
+        # Remove coordinate columns if not needed (saves memory)
+        if not include_coords:
+            df = df.drop(columns=['LAT', 'LON'], errors='ignore')
 
-    def time_until_available(self) -> Optional[int]:
-        """Get seconds until next request is allowed."""
-        if self.can_make_request():
-            return 0
+        # Ensure TIME is datetime
+        if 'TIME' in df.columns:
+            df['TIME'] = pd.to_datetime(df['TIME'])
 
-        oldest_request = self.requests[0]
-        cutoff = oldest_request + timedelta(seconds=self.time_window)
-        return (cutoff - datetime.now()).total_seconds()
-```
+        # Sort by time for better plotting
+        if 'TIME' in df.columns:
+            df = df.sort_values('TIME').reset_index(drop=True)
 
-Add to `GeminiQueryInterpreter`:
-```python
-class GeminiQueryInterpreter:
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash-exp"):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model)
-        self.cache = {}
-        self.rate_limiter = RateLimiter(
-            max_requests=100,
-            time_window=3600  # 100 requests per hour
-        )
+        return df
 
-    def interpret_query(self, query: str, context: Dict) -> ChartParameters:
-        # Check rate limit
-        if not self.rate_limiter.can_make_request():
-            wait_time = self.rate_limiter.time_until_available()
-            raise RateLimitError(
-                f"Rate limit exceeded. Try again in {wait_time:.0f} seconds."
+    @staticmethod
+    def add_site_data(
+        df: pd.DataFrame,
+        sites: list[tuple[str, str, float, float]],
+        tolerance: float = 0.01
+    ) -> pd.DataFrame:
+        """
+        Add site_code and site_name columns by matching LAT/LON.
+
+        Args:
+            df: DataFrame with LAT/LON columns
+            sites: List of (code, name, lat, lon) tuples
+            tolerance: Lat/lon matching tolerance in degrees
+
+        Returns:
+            DataFrame with added 'site_code' and 'site_name' columns
+
+        Example:
+            sites = [
+                ("BV", "Bakersfield - Planz", 35.3528, -119.0369),
+                ("LA", "Los Angeles", 34.0522, -118.2437),
+            ]
+            df = DataFrameConverter.add_site_data(df, sites)
+        """
+
+        if 'LAT' not in df.columns or 'LON' not in df.columns:
+            raise ValueError("DataFrame must have LAT and LON columns")
+
+        # Initialize columns
+        df['site_code'] = None
+        df['site_name'] = None
+
+        # Match each row to nearest site
+        for code, name, site_lat, site_lon in sites:
+            # Find points within tolerance
+            mask = (
+                (abs(df['LAT'] - site_lat) < tolerance) &
+                (abs(df['LON'] - site_lon) < tolerance)
             )
 
-        # Check cache first...
-        cache_key = f"{query}:{hash(json.dumps(context, sort_keys=True))}"
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+            df.loc[mask, 'site_code'] = code
+            df.loc[mask, 'site_name'] = name
 
-        # Make API call
-        self.rate_limiter.record_request()
-        # ... rest of implementation
+        return df
+
+    @staticmethod
+    def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Add useful time-based columns for analysis.
+
+        Args:
+            df: DataFrame with TIME column
+
+        Returns:
+            DataFrame with added columns:
+                - hour: Hour of day (0-23)
+                - day_of_week: Day name (Monday, Tuesday, ...)
+                - is_weekend: Boolean
+                - date: Date only (no time)
+
+        Example:
+            df = DataFrameConverter.add_temporal_features(df)
+            # Now can query: "Plot NO2 on weekdays"
+        """
+
+        if 'TIME' not in df.columns:
+            raise ValueError("DataFrame must have TIME column")
+
+        df['hour'] = df['TIME'].dt.hour
+        df['day_of_week'] = df['TIME'].dt.day_name()
+        df['is_weekend'] = df['TIME'].dt.dayofweek >= 5
+        df['date'] = df['TIME'].dt.date
+
+        return df
 ```
 
-### Phase 5: Testing & Validation
+---
 
-#### 5.1 Unit Tests
-**File**: `tests/test_chart_generator.py`
+### 6. UI Page - AI Analysis Interface
+
+**File: `src/tempo_app/ui/pages/ai_analysis.py` (NEW FILE)**
+
+This is the main UI page where users interact with the AI chart generator.
 
 ```python
-import pytest
-from src.tempo_app.core.chart_generator import ChartGenerator
-import xarray as xr
-import numpy as np
+"""
+AI Analysis page - Natural language chart generation interface.
 
-@pytest.fixture
-def sample_data():
-    """Create sample NO2 data for testing."""
-    times = pd.date_range('2024-08-01', '2024-08-31', freq='H')
-    lats = np.linspace(40.0, 41.0, 10)
-    lons = np.linspace(-112.0, -111.0, 10)
+Users can:
+1. Select a dataset
+2. Type natural language queries
+3. View generated code (and edit it)
+4. See the resulting plot
+5. Save and manage analyses
+"""
 
-    data = np.random.rand(len(times), len(lats), len(lons)) * 1e15
+import asyncio
+from datetime import datetime
+from pathlib import Path
+from uuid import UUID
 
-    return xr.Dataset({
-        'NO2': (['time', 'lat', 'lon'], data)
-    }, coords={
-        'time': times,
-        'lat': lats,
-        'lon': lons
-    })
+import flet as ft
+import pandas as pd
 
-def test_time_series_generation(sample_data, tmp_path):
-    """Test time series chart generation."""
-    generator = ChartGenerator(output_dir=tmp_path)
+from tempo_app.core.chart_generator import ChartGenerator, ChartGenerationError
+from tempo_app.core.df_converter import DataFrameConverter
+from tempo_app.storage.database import DatabaseManager
+from tempo_app.storage.models import Analysis, Dataset
+from tempo_app.ui.theme import (
+    Colors,
+    Spacing,
+    Typography,
+    card_style,
+    section_header_style,
+    primary_button_style
+)
 
-    result = generator.generate_time_series(
-        data=sample_data,
-        variable='NO2',
-        sites=[Site(id='BV', name='Bountiful', lat=40.5, lon=-111.5)],
-        title='Test Chart'
+
+class AIAnalysisPage:
+    """
+    AI-powered chart generation page.
+
+    Layout:
+    ┌─────────────────────────────────────────────┐
+    │ Dataset: [Select Dataset ▾]                │
+    ├─────────────────────────────────────────────┤
+    │ Query: [Type your question here...       ] │
+    │        [Generate Chart]                     │
+    ├─────────────────────────────────────────────┤
+    │ Generated Code:              [Edit] [Run]   │
+    │ ┌─────────────────────────────────────────┐ │
+    │ │ import matplotlib.pyplot as plt         │ │
+    │ │ ...                                     │ │
+    │ └─────────────────────────────────────────┘ │
+    ├─────────────────────────────────────────────┤
+    │ Result:                                     │
+    │ [Chart displayed here]                      │
+    ├─────────────────────────────────────────────┤
+    │ Saved Analyses:                             │
+    │ • NO₂ vs HCHO (2 min ago)                  │
+    │ • Hourly trends (5 min ago)                │
+    └─────────────────────────────────────────────┘
+    """
+
+    def __init__(self, page: ft.Page):
+        self.page = page
+        self.db = DatabaseManager()
+        self.generator = ChartGenerator()
+
+        # State
+        self.selected_dataset: Dataset | None = None
+        self.current_df: pd.DataFrame | None = None
+        self.current_analysis: Analysis | None = None
+
+        # UI Components (initialized in build())
+        self.dataset_dropdown: ft.Dropdown = None
+        self.query_field: ft.TextField = None
+        self.code_editor: ft.TextField = None
+        self.plot_image: ft.Image = None
+        self.status_text: ft.Text = None
+        self.history_list: ft.Column = None
+
+    def build(self) -> ft.Control:
+        """Build the page UI."""
+
+        # Dataset selector
+        self.dataset_dropdown = ft.Dropdown(
+            label="Select Dataset",
+            hint_text="Choose a dataset to analyze",
+            on_change=self._on_dataset_selected,
+            expand=True
+        )
+
+        # Load available datasets
+        self._refresh_datasets()
+
+        # Query input
+        self.query_field = ft.TextField(
+            label="Natural Language Query",
+            hint_text="e.g., Plot NO₂ trends by hour at BV site",
+            multiline=False,
+            expand=True,
+            on_submit=self._on_generate_clicked
+        )
+
+        generate_btn = ft.ElevatedButton(
+            "Generate Chart",
+            icon=ft.icons.AUTO_AWESOME,
+            on_click=self._on_generate_clicked,
+            style=primary_button_style()
+        )
+
+        # Code editor
+        self.code_editor = ft.TextField(
+            label="Generated Code (Editable)",
+            multiline=True,
+            min_lines=10,
+            max_lines=20,
+            expand=True,
+            text_style=ft.TextStyle(
+                font_family="Consolas",
+                size=Typography.BODY_SMALL
+            ),
+            read_only=False
+        )
+
+        edit_btn = ft.TextButton(
+            "Run Code",
+            icon=ft.icons.PLAY_ARROW,
+            on_click=self._on_run_code_clicked
+        )
+
+        save_btn = ft.TextButton(
+            "Save Analysis",
+            icon=ft.icons.SAVE,
+            on_click=self._on_save_clicked
+        )
+
+        # Plot viewer
+        self.plot_image = ft.Image(
+            visible=False,
+            width=800,
+            height=600,
+            fit=ft.ImageFit.CONTAIN
+        )
+
+        # Status indicator
+        self.status_text = ft.Text(
+            "",
+            size=Typography.BODY_SMALL,
+            color=Colors.INFO,
+            italic=True
+        )
+
+        # Saved analyses history
+        self.history_list = ft.Column(
+            spacing=Spacing.SM,
+            scroll=ft.ScrollMode.AUTO,
+            height=200
+        )
+
+        # Layout
+        return ft.Container(
+            content=ft.Column([
+                # Header
+                ft.Text(
+                    "AI Chart Analysis",
+                    **section_header_style()
+                ),
+
+                # Dataset selector
+                ft.Container(
+                    content=self.dataset_dropdown,
+                    **card_style(),
+                    padding=Spacing.MD
+                ),
+
+                # Query input
+                ft.Container(
+                    content=ft.Column([
+                        ft.Row([
+                            self.query_field,
+                            generate_btn
+                        ]),
+                        self.status_text
+                    ]),
+                    **card_style(),
+                    padding=Spacing.MD
+                ),
+
+                # Code editor
+                ft.Container(
+                    content=ft.Column([
+                        ft.Row([
+                            ft.Text("Generated Code", weight=ft.FontWeight.BOLD),
+                            ft.Row([edit_btn, save_btn], spacing=Spacing.SM)
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        self.code_editor
+                    ]),
+                    **card_style(),
+                    padding=Spacing.MD
+                ),
+
+                # Plot viewer
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text("Result", weight=ft.FontWeight.BOLD),
+                        self.plot_image
+                    ]),
+                    **card_style(),
+                    padding=Spacing.MD
+                ),
+
+                # History
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text("Saved Analyses", weight=ft.FontWeight.BOLD),
+                        self.history_list
+                    ]),
+                    **card_style(),
+                    padding=Spacing.MD
+                )
+            ], spacing=Spacing.LG, scroll=ft.ScrollMode.AUTO),
+            padding=Spacing.PAGE_HORIZONTAL
+        )
+
+    def _refresh_datasets(self):
+        """Load datasets into dropdown."""
+        datasets = self.db.get_all_datasets()
+        self.dataset_dropdown.options = [
+            ft.dropdown.Option(key=str(ds.id), text=ds.name)
+            for ds in datasets
+            if ds.is_complete  # Only show complete datasets
+        ]
+        self.page.update()
+
+    async def _on_dataset_selected(self, e):
+        """Handle dataset selection."""
+        dataset_id = UUID(e.control.value)
+        self.selected_dataset = self.db.get_dataset(dataset_id)
+
+        if not self.selected_dataset:
+            return
+
+        # Load dataset into DataFrame
+        self.status_text.value = "Loading dataset..."
+        self.page.update()
+
+        try:
+            # Run in thread to avoid blocking UI
+            self.current_df = await asyncio.to_thread(
+                DataFrameConverter.dataset_to_dataframe,
+                Path(self.selected_dataset.file_path),
+                include_coords=True,
+                downsample=None  # Load full data
+            )
+
+            # Add temporal features for easier querying
+            self.current_df = DataFrameConverter.add_temporal_features(
+                self.current_df
+            )
+
+            # Add site data if available
+            sites = self.db.get_all_sites()
+            if sites:
+                site_data = [(s.code, s.name, s.latitude, s.longitude) for s in sites]
+                self.current_df = DataFrameConverter.add_site_data(
+                    self.current_df,
+                    site_data
+                )
+
+            self.status_text.value = f"Loaded {len(self.current_df):,} rows"
+            self.status_text.color = Colors.SUCCESS
+
+            # Load analysis history
+            self._refresh_history()
+
+        except Exception as ex:
+            self.status_text.value = f"Error loading dataset: {str(ex)}"
+            self.status_text.color = Colors.ERROR
+
+        self.page.update()
+
+    async def _on_generate_clicked(self, e):
+        """Handle 'Generate Chart' button click."""
+
+        if not self.selected_dataset or self.current_df is None:
+            self._show_error("Please select a dataset first")
+            return
+
+        query = self.query_field.value.strip()
+        if not query:
+            self._show_error("Please enter a query")
+            return
+
+        self.status_text.value = "Generating code with AI..."
+        self.status_text.color = Colors.INFO
+        self.page.update()
+
+        try:
+            # Get DataFrame schema
+            schema = await asyncio.to_thread(
+                self.generator.get_dataframe_schema,
+                self.current_df
+            )
+
+            # Generate code via Gemini API
+            code = await asyncio.to_thread(
+                self.generator.generate_code,
+                query,
+                schema
+            )
+
+            # Display code
+            self.code_editor.value = code
+            self.status_text.value = "Code generated. Click 'Run Code' to execute."
+            self.status_text.color = Colors.SUCCESS
+            self.page.update()
+
+            # Auto-execute
+            await self._execute_code(code, query)
+
+        except ChartGenerationError as ex:
+            self._show_error(f"Generation failed: {str(ex)}")
+        except Exception as ex:
+            self._show_error(f"Unexpected error: {str(ex)}")
+
+    async def _on_run_code_clicked(self, e):
+        """Handle 'Run Code' button (for edited code)."""
+        code = self.code_editor.value.strip()
+        if not code:
+            self._show_error("No code to execute")
+            return
+
+        query = self.query_field.value.strip() or "Custom plot"
+        await self._execute_code(code, query)
+
+    async def _execute_code(self, code: str, query: str):
+        """Execute the code and display the plot."""
+
+        if self.current_df is None:
+            self._show_error("No dataset loaded")
+            return
+
+        self.status_text.value = "Executing code..."
+        self.status_text.color = Colors.INFO
+        self.page.update()
+
+        try:
+            # Create output path
+            output_dir = Path.home() / ".tempo_analyzer" / "analyses"
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = output_dir / f"plot_{timestamp}.png"
+
+            # Execute code
+            plot_path = await asyncio.to_thread(
+                self.generator.execute_code,
+                code,
+                self.current_df,
+                output_path
+            )
+
+            # Display plot
+            self.plot_image.src = str(plot_path)
+            self.plot_image.visible = True
+
+            self.status_text.value = "Chart generated successfully!"
+            self.status_text.color = Colors.SUCCESS
+
+            # Create analysis object (not saved yet)
+            self.current_analysis = Analysis.new(
+                dataset_id=self.selected_dataset.id,
+                query=query,
+                code=code,
+                plot_path=str(plot_path)
+            )
+
+        except ChartGenerationError as ex:
+            self._show_error(f"Execution failed: {str(ex)}")
+        except Exception as ex:
+            self._show_error(f"Unexpected error: {str(ex)}")
+
+        self.page.update()
+
+    async def _on_save_clicked(self, e):
+        """Save the current analysis to database."""
+
+        if not self.current_analysis:
+            self._show_error("No analysis to save")
+            return
+
+        try:
+            self.db.save_analysis(self.current_analysis)
+            self.status_text.value = "Analysis saved!"
+            self.status_text.color = Colors.SUCCESS
+
+            # Refresh history
+            self._refresh_history()
+
+        except Exception as ex:
+            self._show_error(f"Save failed: {str(ex)}")
+
+        self.page.update()
+
+    def _refresh_history(self):
+        """Load saved analyses for current dataset."""
+
+        if not self.selected_dataset:
+            return
+
+        analyses = self.db.get_analyses_for_dataset(self.selected_dataset.id)
+
+        self.history_list.controls.clear()
+
+        for analysis in analyses:
+            # Calculate time ago
+            time_ago = self._format_time_ago(analysis.created_at)
+
+            item = ft.ListTile(
+                title=ft.Text(analysis.name),
+                subtitle=ft.Text(f"{analysis.query} • {time_ago}"),
+                leading=ft.Icon(ft.icons.INSERT_CHART),
+                on_click=lambda e, a=analysis: self._load_analysis(a)
+            )
+            self.history_list.controls.append(item)
+
+        self.page.update()
+
+    def _load_analysis(self, analysis: Analysis):
+        """Load a saved analysis into the editor."""
+        self.current_analysis = analysis
+        self.query_field.value = analysis.query
+        self.code_editor.value = analysis.code
+        self.plot_image.src = analysis.plot_path
+        self.plot_image.visible = True
+        self.page.update()
+
+    def _show_error(self, message: str):
+        """Display error message."""
+        self.status_text.value = message
+        self.status_text.color = Colors.ERROR
+        self.page.update()
+
+    @staticmethod
+    def _format_time_ago(dt: datetime) -> str:
+        """Format datetime as 'X mins ago'."""
+        delta = datetime.now() - dt
+
+        if delta.seconds < 60:
+            return "Just now"
+        elif delta.seconds < 3600:
+            mins = delta.seconds // 60
+            return f"{mins} min{'s' if mins != 1 else ''} ago"
+        elif delta.seconds < 86400:
+            hours = delta.seconds // 3600
+            return f"{hours} hour{'s' if hours != 1 else ''} ago"
+        else:
+            return dt.strftime("%Y-%m-%d")
+```
+
+---
+
+### 7. Settings Page Integration
+
+**File: `src/tempo_app/ui/pages/settings.py`**
+
+Add Gemini API key configuration section (add to existing settings page):
+
+```python
+# Add this to the existing SettingsPage class
+
+def _build_ai_section(self) -> ft.Container:
+    """Build AI configuration section."""
+
+    gemini_key_field = ft.TextField(
+        label="Google Gemini API Key",
+        hint_text="Enter your Gemini API key",
+        password=True,
+        can_reveal_password=True,
+        value=self.config.get("gemini_api_key"),
+        on_change=self._on_gemini_key_changed,
+        expand=True
     )
 
-    assert result.png_path.exists()
-    assert result.svg_path.exists()
-    assert result.script_path.exists()
-    assert 'plt.plot' in result.script_code
-
-def test_script_regeneration(sample_data, tmp_path):
-    """Test that generated scripts can reproduce charts."""
-    generator = ChartGenerator(output_dir=tmp_path)
-
-    result = generator.generate_time_series(...)
-
-    # Execute generated script
-    exec(result.script_code)
-
-    # Verify regenerated chart exists
-    assert Path('chart_regenerated.png').exists()
-```
-
-**File**: `tests/test_gemini_integration.py`
-
-```python
-import pytest
-from src.tempo_app.integrations.gemini_client import GeminiQueryInterpreter
-from unittest.mock import Mock, patch
-
-@pytest.fixture
-def mock_gemini():
-    with patch('google.generativeai.GenerativeModel') as mock:
-        yield mock
-
-def test_query_interpretation(mock_gemini):
-    """Test NL query interpretation."""
-    # Mock Gemini response
-    mock_response = Mock()
-    mock_response.text = json.dumps({
-        'chart_type': 'time_series',
-        'variables': ['NO2'],
-        'sites': [{'site_id': 'BV', 'name': 'Bountiful'}],
-        # ... rest of schema
-    })
-    mock_gemini.return_value.generate_content.return_value = mock_response
-
-    interpreter = GeminiQueryInterpreter(api_key='test_key')
-
-    result = interpreter.interpret_query(
-        query='Show NO2 at Bountiful',
-        context={'sites': [{'id': 'BV', 'name': 'Bountiful'}]}
+    help_text = ft.Text(
+        "Get a free API key at: https://makersuite.google.com/app/apikey",
+        size=Typography.BODY_SMALL,
+        color=Colors.INFO,
+        italic=True
     )
 
-    assert result.chart_type == 'time_series'
-    assert result.variables == ['NO2']
-    assert result.sites[0]['site_id'] == 'BV'
+    return ft.Container(
+        content=ft.Column([
+            ft.Text("AI Analysis", **section_header_style()),
+            gemini_key_field,
+            help_text,
+            ft.Text(
+                "⚠️ The API key is stored locally and used only for generating chart code.",
+                size=Typography.BODY_SMALL,
+                color=Colors.WARNING
+            )
+        ], spacing=Spacing.SM),
+        **card_style(),
+        padding=Spacing.MD
+    )
 
-def test_clarification_needed(mock_gemini):
-    """Test ambiguous query handling."""
-    mock_response = Mock()
-    mock_response.text = json.dumps({
-        'chart_type': 'time_series',
-        'clarifications_needed': [{
-            'question': 'Which site?',
-            'options': ['BV', 'HC'],
-            'context': 'Multiple sites found'
-        }]
-    })
-    mock_gemini.return_value.generate_content.return_value = mock_response
-
-    interpreter = GeminiQueryInterpreter(api_key='test_key')
-    result = interpreter.interpret_query('Show NO2', context={})
-
-    assert len(result.clarifications_needed) == 1
-    assert 'Which site?' in result.clarifications_needed[0]['question']
+def _on_gemini_key_changed(self, e):
+    """Handle Gemini API key change."""
+    self.config.set("gemini_api_key", e.control.value)
 ```
 
-#### 5.2 Integration Tests
-**File**: `tests/test_nl_to_chart_flow.py`
+Then add this section to the settings page layout:
+```python
+# In the build() method, add:
+self._build_ai_section(),
+```
+
+---
+
+### 8. Navigation Integration
+
+**File: `src/tempo_app/ui/shell.py`**
+
+Add the new AI Analysis page to navigation:
 
 ```python
-import pytest
-from src.tempo_app.ui.pages.charts import ChartsPage
+# Add import
+from tempo_app.ui.pages.ai_analysis import AIAnalysisPage
 
-@pytest.mark.integration
-async def test_full_nl_to_chart_flow(db_session, sample_dataset):
-    """Test complete flow from NL query to chart generation."""
-    page = ChartsPage(page=Mock(), db_session=db_session)
+# In the AppShell class __init__, add to page_cache:
+self.page_cache = {
+    "/library": None,
+    "/new": None,
+    "/batch": None,
+    "/workspace": None,
+    "/export": None,
+    "/ai": None,  # NEW
+    "/inspect": None,
+    "/settings": None,
+}
 
-    # Simulate user query
-    query = "Show NO2 trends at BV site for August 2024"
+# In _build_nav_bar(), add tab:
+ft.Tab(
+    text="AI Analysis",
+    icon=ft.icons.AUTO_AWESOME,
+    content=ft.Container()  # Lazy loaded
+),
 
-    # Interpret query
-    params = await page._async_interpret(query, context=...)
+# In _on_tab_changed(), add route:
+routes = ["/library", "/new", "/batch", "/workspace", "/export", "/ai", "/inspect"]
 
-    # Validate
-    validation = page.validator.validate(params)
-    assert validation.is_valid
+# In _load_page(), add case:
+case "/ai":
+    if not self.page_cache["/ai"]:
+        self.page_cache["/ai"] = AIAnalysisPage(self.page).build()
+    return self.page_cache["/ai"]
+```
 
-    # Generate chart
-    result = await page._async_generate_chart(params)
+---
 
-    # Verify outputs
-    assert result.png_path.exists()
-    assert result.script_path.exists()
-    assert 'NO2' in result.metadata['variables']
+## Security Considerations
 
-@pytest.mark.integration
-async def test_clarification_flow(db_session):
-    """Test interactive clarification flow."""
-    page = ChartsPage(page=Mock(), db_session=db_session)
+### 1. Code Execution Sandbox
 
-    # Ambiguous query
-    query = "Show trends"  # No variable or site specified
+The `execute_code()` function restricts available globals:
 
-    params = await page._async_interpret(query, context=...)
-
-    # Should request clarifications
-    assert len(params.clarifications_needed) > 0
-
-    # Simulate user providing clarifications
-    clarifications = {
-        0: "NO2",  # Variable
-        1: "BV"    # Site
+```python
+safe_globals = {
+    'pd': pd,
+    'np': np,
+    'plt': plt,
+    'df': df,
+    '__builtins__': {
+        # Only safe built-ins - NO file I/O, NO subprocess, NO imports
+        'len': len, 'range': range, 'sum': sum, ...
     }
-
-    # Re-interpret with clarifications
-    # ...
-```
-
-#### 5.3 Manual Testing Checklist
-
-1. **Unambiguous Query Test**
-   - Input: "Show NO₂ time series at Bountiful for August 2024"
-   - Expected: Direct chart generation without clarifications
-   - Verify: Chart shows NO₂ on Y-axis, dates on X-axis, data only for August
-
-2. **Ambiguous Query Test**
-   - Input: "Show trends"
-   - Expected: Clarification dialog asking for variable and site
-   - Verify: User can select from available options, chart generates after selection
-
-3. **Invalid Query Test**
-   - Input: "Show CO₂ at Mars"
-   - Expected: Error message explaining CO₂ is not available
-   - Verify: Helpful error with suggestions for valid variables
-
-4. **Complex Query Test**
-   - Input: "Compare weekday vs weekend NO₂ at BV when cloud fraction < 0.3"
-   - Expected: Chart with two lines (weekday, weekend), only low-cloud data
-   - Verify: Correct filtering applied
-
-5. **Script Regeneration Test**
-   - Generate chart from NL query
-   - Navigate to saved chart folder
-   - Run `python generate_chart.py`
-   - Verify: `chart_regenerated.png` matches original
-
-6. **API Error Handling**
-   - Disconnect from internet
-   - Try to generate chart
-   - Expected: Clear error message, option to use manual chart builder
-   - Verify: App doesn't crash, user can still work offline
-
-7. **Rate Limit Test**
-   - Make 101 requests in quick succession
-   - Expected: 101st request shows "Rate limit exceeded" with countdown
-   - Verify: User can still browse history, view saved charts
-
-## Critical Files Summary
-
-### New Files
-| File | Purpose | Lines (est) |
-|------|---------|-------------|
-| `src/tempo_app/core/chart_generator.py` | Matplotlib chart generation | 500 |
-| `src/tempo_app/integrations/gemini_client.py` | Gemini API client | 300 |
-| `src/tempo_app/core/chart_validator.py` | Parameter validation | 200 |
-| `src/tempo_app/integrations/rate_limiter.py` | API rate limiting | 100 |
-| `src/tempo_app/ui/pages/charts.py` | Charts UI page | 400 |
-| `src/tempo_app/ui/components/chart_display.py` | Chart viewer | 200 |
-| `src/tempo_app/ui/components/clarification_dialog.py` | Interactive Q&A | 150 |
-| `tests/test_chart_generator.py` | Chart generation tests | 300 |
-| `tests/test_gemini_integration.py` | Gemini client tests | 250 |
-| `tests/test_nl_to_chart_flow.py` | Integration tests | 200 |
-
-### Modified Files
-| File | Changes |
-|------|---------|
-| `src/tempo_app/storage/models.py` | Add `GeneratedChart` model |
-| `src/tempo_app/ui/app.py` | Add charts page route |
-| `src/tempo_app/config.py` | Add Gemini settings |
-| `requirements.txt` | Add `google-generativeai` |
-
-### Configuration Files
-| File | Purpose |
-|------|---------|
-| `.env.example` | Gemini API key template |
-| `alembic/versions/xxx_add_charts.py` | Database migration |
-
-## Dependencies to Add
-
-```txt
-# requirements.txt additions
-google-generativeai>=0.3.0  # Gemini API client
-```
-
-## Risks & Mitigation Strategies
-
-### Risk 1: API Costs Exceed Free Tier
-**Likelihood**: Medium
-**Impact**: Medium
-
-**Mitigation**:
-- Implement aggressive caching (1 hour TTL for identical queries)
-- Rate limiting (100 queries/hour per user)
-- Usage monitoring dashboard
-- Alert when approaching 80% of quota
-- Fallback to manual chart builder when limit exceeded
-
-**Monitoring**:
-```python
-class UsageMonitor:
-    def track_api_call(self, user_id, cost):
-        # Log to database
-        # Check daily/monthly limits
-        # Send alerts if needed
-        pass
-```
-
-### Risk 2: Gemini Generates Invalid/Unsafe Parameters
-**Likelihood**: Low
-**Impact**: High
-
-**Mitigation**:
-- Strict JSON schema validation
-- Database validation (dataset/site IDs must exist)
-- Sandboxed script execution
-- Never execute arbitrary code from Gemini
-- Whitelist allowed chart types and parameters
-
-**Example**:
-```python
-# SAFE: Gemini only returns data parameters
-{
-  "chart_type": "time_series",  # From whitelist
-  "dataset_id": "uuid",  # Validated against DB
-  "sites": ["BV"]  # Validated against DB
-}
-
-# UNSAFE: Don't allow this
-{
-  "custom_code": "import os; os.system('rm -rf /')"  # NEVER execute
 }
 ```
 
-### Risk 3: Slow API Response Times
-**Likelihood**: Medium
-**Impact**: Medium
+**What's blocked:**
+- ❌ File operations (`open()`, `Path.write_text()`)
+- ❌ Subprocess execution (`os.system()`, `subprocess.run()`)
+- ❌ Dynamic imports (`__import__()`, `importlib`)
+- ❌ Network access (`requests`, `urllib`)
+- ❌ System modification (`os.remove()`, `shutil.rmtree()`)
 
-**Mitigation**:
-- Show loading state with progress indicator
-- Timeout after 30 seconds
-- Async UI (page remains responsive)
-- Cache common queries
-- Option to cancel request
+**What's allowed:**
+- ✅ Data manipulation (pandas, numpy)
+- ✅ Plotting (matplotlib)
+- ✅ Basic Python operations (math, string, list operations)
 
-**UX**:
+### 2. Data Privacy
+
+**What's sent to Gemini:**
+- ✅ Column names (`["TIME", "NO2_TropVCD", ...]`)
+- ✅ Data types (`{"TIME": "datetime64[ns]", ...}`)
+- ✅ Sample categorical values (`{"site_code": ["BV", "LA"]}`)
+
+**What's NOT sent:**
+- ❌ Actual data values
+- ❌ Full DataFrame contents
+- ❌ User's file paths
+
+### 3. API Key Storage
+
+- Stored in `~/.tempo_analyzer/config.json` (user's home directory)
+- Not committed to version control (add to `.gitignore`)
+- Password field in UI (not visible on screen)
+
+---
+
+## Error Handling
+
+### Gemini API Errors
+
 ```python
-async def on_generate_click(self, e):
-    self.loading.visible = True
-    self.status_text.value = "Interpreting your request... (usually <5s)"
-
-    try:
-        with timeout(30):
-            params = await self.gemini.interpret_query(...)
-    except TimeoutError:
-        self.status_text.value = "Request timed out. Try simplifying your query or use manual mode."
+try:
+    code = generator.generate_code(query, schema)
+except ChartGenerationError as e:
+    if "API key" in str(e):
+        # Show setup instructions
+        show_error("Please configure your Gemini API key in Settings")
+    elif "quota" in str(e).lower():
+        # Rate limit hit
+        show_error("API quota exceeded. Please try again later.")
+    else:
+        # Generic error
+        show_error(f"Code generation failed: {e}")
 ```
 
-### Risk 4: Model Updates Break Reproducibility
-**Likelihood**: Medium
-**Impact**: Low
+### Code Execution Errors
 
-**Mitigation**:
-- Generated Matplotlib scripts are source of truth
-- Save Gemini model version in metadata
-- Scripts work indefinitely without AI
-- Pin to specific Gemini model version
-- Document model used for each chart
-
-**Metadata**:
-```json
-{
-  "gemini_model": "gemini-2.0-flash-exp",
-  "gemini_version": "2.0",
-  "generated_at": "2024-08-15T14:32:00Z",
-  "can_regenerate_without_ai": true
-}
-```
-
-### Risk 5: Users Prefer Manual UI
-**Likelihood**: Medium
-**Impact**: Low
-
-**Mitigation**:
-- Implement both NL and manual interfaces
-- A/B test to see which is more popular
-- User preference setting
-- Make NL optional (feature flag)
-
-**Configuration**:
 ```python
-class UserPreferences:
-    default_chart_mode: Literal['nl', 'manual'] = 'nl'
-    show_both_options: bool = True
+try:
+    plot_path = generator.execute_code(code, df, output_path)
+except ChartGenerationError as e:
+    # Save error to analysis record
+    analysis.error_message = str(e)
+    db.save_analysis(analysis)
+
+    # Show user-friendly error
+    show_error("Code execution failed. Check the code for errors.")
 ```
 
-## Alternative Approaches Considered
+### Dataset Loading Errors
 
-### Alternative 1: Pure Matplotlib UI (No Gemini)
-**Pros**:
-- Zero API costs
-- Instant response
-- Fully offline
-- No external dependencies
-
-**Cons**:
-- Steeper learning curve
-- More clicks for complex queries
-- Less discoverable
-
-**Decision**: Implement BOTH as described in plan
-
-### Alternative 2: Gemini Generates Charts Directly
-**Pros**:
-- Simpler architecture
-- Less code to maintain
-
-**Cons**:
-- ❌ Not reproducible (AI output varies)
-- ❌ Can't control chart quality/formatting
-- ❌ Sends atmospheric data to external API
-- ❌ Can't tweak parameters precisely
-- ❌ Unsuitable for publications
-
-**Decision**: REJECTED - Fails scientific requirements
-
-### Alternative 3: Local LLM (Llama, Mistral)
-**Pros**:
-- No API costs
-- Full data privacy
-- No rate limits
-- Works offline
-
-**Cons**:
-- Requires GPU or slow CPU inference
-- Larger application size
-- Complex setup for end users
-- Lower quality interpretations
-
-**Decision**: DEFERRED - Consider for future if Gemini costs become prohibitive
-
-### Alternative 4: Template-Based Query Builder
-**Pros**:
-- No AI needed
-- Instant response
-- Predictable results
-
-**Cons**:
-- Less flexible than NL
-- Still requires learning templates
-- Not as user-friendly
-
-**Example**:
-```
-Template: "Show {variable} at {site} from {start} to {end} for {days} when {filters}"
-Filled: "Show NO2 at BV from 2024-08-01 to 2024-08-31 for weekdays when cloud < 0.3"
+```python
+try:
+    df = DataFrameConverter.dataset_to_dataframe(path)
+except Exception as e:
+    show_error(f"Failed to load dataset: {e}")
+    # Suggest using a different dataset or re-downloading
 ```
 
-**Decision**: Could combine with NL - templates help users learn query syntax
+---
 
-## Phased Rollout Recommendation
+## Testing Strategy
 
-### Phase 1: MVP (Week 1-2)
-**Scope**:
-- Time series charts only
-- Basic Gemini integration
-- Simple validation
-- Manual chart builder
+### 1. Unit Tests
 
-**Goal**: Validate concept, get user feedback
+**Test file: `tests/test_chart_generator.py`**
 
-### Phase 2: Full Feature Set (Week 3-4)
-**Scope**:
-- All 5 chart types
-- Comprehensive clarification dialogs
-- Chart history
-- Script regeneration
+```python
+import pytest
+from tempo_app.core.chart_generator import ChartGenerator
 
-**Goal**: Production-ready feature
+def test_code_extraction_with_markdown():
+    """Test extracting code from markdown-wrapped response."""
+    response = """Here's the code:
+    ```python
+    import matplotlib.pyplot as plt
+    plt.plot([1, 2, 3])
+    ```
+    """
 
-### Phase 3: Polish & Optimization (Week 5+)
-**Scope**:
-- Advanced caching strategies
-- Usage analytics
-- Performance optimization
-- Publication templates
+    generator = ChartGenerator()
+    code = generator._extract_code(response)
 
-**Goal**: Scale to many users
+    assert "import matplotlib.pyplot as plt" in code
+    assert "```" not in code  # Markdown removed
 
-### Future Enhancements (Beyond Initial Release)
-- AI-generated insights ("Anomaly detected on Aug 15")
-- Batch chart generation
-- Custom chart templates
-- Multi-panel figures
-- Export to PowerPoint/LaTeX
-- Collaborative chart sharing
+def test_safe_execution_blocks_file_io():
+    """Test that file operations are blocked."""
+    code = "open('/etc/passwd', 'r').read()"
 
-## Final Recommendation
+    with pytest.raises(ChartGenerationError):
+        generator.execute_code(code, pd.DataFrame(), Path("output.png"))
 
-**YES - Implement this hybrid NL-to-Matplotlib approach** with these critical success factors:
+def test_schema_extraction():
+    """Test DataFrame schema extraction."""
+    df = pd.DataFrame({
+        'TIME': pd.date_range('2024-01-01', periods=10, freq='H'),
+        'NO2': [1.0, 2.0, 3.0] * 3 + [1.0],
+        'site': ['BV'] * 10
+    })
 
-1. ✅ **Gemini as interpreter, not generator** - Preserves scientific control
-2. ✅ **Save generated Matplotlib code** - Ensures reproducibility for publications
-3. ✅ **Data privacy by design** - Only metadata sent to API
-4. ✅ **Manual fallback** - Works when API is down
-5. ✅ **Aggressive caching** - Minimizes costs
-6. ✅ **Strict validation** - Prevents invalid charts
+    schema = generator.get_dataframe_schema(df)
 
-This architecture delivers the user-friendly NL interface while maintaining the scientific rigor required for research publications. The saved Matplotlib scripts ensure that charts can be regenerated identically for years to come, regardless of AI model changes.
+    assert 'TIME' in schema['columns']
+    assert 'datetime64' in schema['dtypes']['TIME']
+    assert 'BV' in schema['sample_values']['site']
+```
 
-The key insight: **Use AI for the interface, not the implementation**. Gemini translates human intent into structured parameters, but Matplotlib does the actual work. This separation preserves reproducibility while adding convenience.
+### 2. Integration Tests
+
+**Test file: `tests/test_ai_workflow.py`**
+
+```python
+def test_end_to_end_chart_generation(tmp_path):
+    """Test full workflow from query to saved plot."""
+
+    # Create test dataset
+    df = create_test_dataframe()
+
+    # Generate code
+    generator = ChartGenerator()
+    schema = generator.get_dataframe_schema(df)
+    code = generator.generate_code("Plot NO2 by hour", schema)
+
+    # Execute code
+    output_path = tmp_path / "test_plot.png"
+    plot_path = generator.execute_code(code, df, output_path)
+
+    # Verify plot exists
+    assert plot_path.exists()
+    assert plot_path.stat().st_size > 1000  # Non-empty image
+```
+
+### 3. Manual Testing Checklist
+
+- [ ] Configure Gemini API key in Settings
+- [ ] Select a complete dataset
+- [ ] Enter query: "Plot NO2 trends by hour"
+- [ ] Verify code is generated and displayed
+- [ ] Verify plot is created and visible
+- [ ] Edit code (e.g., change title) and re-run
+- [ ] Save analysis to database
+- [ ] Load saved analysis from history
+- [ ] Test error cases:
+  - [ ] Invalid API key
+  - [ ] Malformed query
+  - [ ] Code with syntax error
+  - [ ] Empty dataset
+
+---
+
+## Performance Optimization
+
+### 1. DataFrame Downsampling
+
+For large datasets (>100k rows), downsample before analysis:
+
+```python
+# In DataFrameConverter.dataset_to_dataframe()
+if len(df) > 100_000:
+    # Take every 10th point
+    df = df.iloc[::10]
+```
+
+### 2. Lazy Loading
+
+Don't load DataFrame until user clicks "Generate":
+
+```python
+async def _on_generate_clicked(self, e):
+    if self.current_df is None:
+        # Load on-demand
+        await self._load_dataset()
+
+    # Then generate code
+    ...
+```
+
+### 3. Caching Gemini Responses
+
+Cache identical queries to avoid redundant API calls:
+
+```python
+# In ChartGenerator
+self._cache = {}  # {query_hash: code}
+
+def generate_code(self, query, schema):
+    cache_key = hash((query, frozenset(schema['columns'])))
+
+    if cache_key in self._cache:
+        return self._cache[cache_key]
+
+    code = self._call_gemini(query, schema)
+    self._cache[cache_key] = code
+    return code
+```
+
+---
+
+## Example Queries
+
+Here are queries users can try:
+
+### Time Series
+- "Plot NO₂ levels over time at BV site"
+- "Show HCHO trends for the past week"
+- "Compare NO₂ at BV and LA sites on the same chart"
+
+### Aggregations
+- "Plot average NO₂ by hour of day"
+- "Show median HCHO levels by day of week"
+- "Create a bar chart of NO₂ averages for each site"
+
+### Correlations
+- "Scatter plot of NO₂ vs HCHO"
+- "Plot FNR (HCHO/NO₂ ratio) over time"
+
+### Statistical
+- "Box plot of NO₂ distribution by site"
+- "Histogram of HCHO values"
+- "Show NO₂ quantiles (25th, 50th, 75th) by hour"
+
+### Filtering
+- "Plot NO₂ only on weekdays"
+- "Show HCHO during rush hours (7-9 AM and 5-7 PM)"
+- "Compare NO₂ on weekends vs weekdays"
+
+---
+
+## Deployment Checklist
+
+### Phase 1: Core Implementation
+- [ ] Add `google-generativeai` to requirements.txt
+- [ ] Create `core/chart_generator.py`
+- [ ] Create `core/df_converter.py`
+- [ ] Add Analysis model to `storage/models.py`
+- [ ] Update `storage/database.py` with analysis methods
+- [ ] Update `core/config.py` with gemini_api_key
+
+### Phase 2: UI Implementation
+- [ ] Create `ui/pages/ai_analysis.py`
+- [ ] Update `ui/pages/settings.py` with API key field
+- [ ] Update `ui/shell.py` with navigation
+
+### Phase 3: Testing
+- [ ] Unit tests for ChartGenerator
+- [ ] Integration tests for workflow
+- [ ] Manual testing with real datasets
+- [ ] Security audit of code execution
+
+### Phase 4: Documentation
+- [ ] Update README with AI Analysis feature
+- [ ] Add example queries to user guide
+- [ ] Document API key setup process
+
+---
+
+## Future Enhancements
+
+### Phase 3: Advanced Features
+- [ ] **Multi-chart layouts**: Generate subplots (2x2 grid)
+- [ ] **Interactive plots**: Use Plotly instead of matplotlib
+- [ ] **Data export**: Export filtered data to CSV
+- [ ] **Code templates**: Pre-built chart templates for common queries
+- [ ] **Code history**: Track all code versions for an analysis
+
+### Phase 4: Collaboration
+- [ ] **Share analyses**: Export analysis (code + plot + query) as JSON
+- [ ] **Import analyses**: Load shared analyses from other users
+- [ ] **Analysis templates**: Build library of common analyses
+
+### Phase 5: Advanced AI
+- [ ] **Multi-step queries**: "First filter weekdays, then plot NO₂ vs time"
+- [ ] **Anomaly detection**: "Highlight days with unusually high NO₂"
+- [ ] **Statistical summaries**: "Summarize NO₂ statistics in text"
+
+---
+
+## Cost Estimation
+
+### Gemini API Pricing (as of 2024)
+
+**gemini-1.5-flash** (recommended):
+- Input: $0.075 per 1M tokens
+- Output: $0.30 per 1M tokens
+
+**Typical query cost:**
+- Prompt: ~1,000 tokens (DataFrame schema + instructions)
+- Response: ~200 tokens (generated code)
+- **Cost per query: ~$0.0001 (0.01 cents)**
+
+**Free tier:**
+- 15 requests per minute
+- 1 million tokens per day
+- **~10,000 free queries per day**
+
+**Budget estimate for 1000 users:**
+- Average 10 queries/user/day = 10,000 queries/day
+- Cost: ~$1/day = **$30/month**
+
+---
+
+## Conclusion
+
+This implementation provides a **lightweight, transparent, and reproducible** AI chart generation system:
+
+✅ **Lightweight**: No heavy dependencies, just direct Gemini API
+✅ **Transparent**: Users see and can edit all generated code
+✅ **Reproducible**: Every plot is saved with its source code
+✅ **Safe**: Sandboxed code execution prevents malicious code
+✅ **Cost-effective**: Free tier covers most use cases
+
+**Next Steps:**
+1. Get Gemini API key: https://makersuite.google.com/app/apikey
+2. Implement core components (chart_generator.py, database model)
+3. Build UI page (ai_analysis.py)
+4. Test with real TEMPO datasets
+5. Deploy and gather user feedback
+
+**Estimated implementation time**: 2-3 days for a working prototype

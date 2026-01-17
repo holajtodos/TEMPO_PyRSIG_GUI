@@ -463,7 +463,7 @@ class WorkerProgressPanel(ft.Container):
                 "bar": worker_bar,
             })
         
-        worker_column = ft.Column(
+        self._worker_column = ft.Column(
             controls=[r["container"] for r in self._worker_rows],
             spacing=6,
         )
@@ -480,7 +480,7 @@ class WorkerProgressPanel(ft.Container):
                     self._overall_text,
                     self._overall_bar,
                     ft.Container(height=8),
-                    worker_column,
+                    self._worker_column,
                 ],
                 spacing=6,
             ),
@@ -490,6 +490,43 @@ class WorkerProgressPanel(ft.Container):
             border=ft.Border.all(1, Colors.BORDER),
             padding=16,
         )
+
+    def set_workers(self, count: int):
+        """Update the number of worker rows."""
+        if count == self._num_workers:
+            return
+            
+        self._num_workers = count
+        self._worker_rows.clear()
+        
+        for i in range(count):
+            worker_bar = ft.ProgressBar(
+                value=None,
+                color=Colors.INFO,
+                bgcolor=Colors.SURFACE_VARIANT,
+                width=200,
+            )
+            worker_label = ft.Text(
+                f"Worker {i+1}: Idle",
+                size=12,
+                color=Colors.ON_SURFACE_VARIANT,
+                width=250,
+            )
+            row = ft.Container(
+                content=ft.Row([
+                    worker_label,
+                    worker_bar,
+                ], spacing=12),
+                visible=False, # Hidden until show() is called
+            )
+            self._worker_rows.append({
+                "container": row,
+                "label": worker_label,
+                "bar": worker_bar,
+            })
+            
+        self._worker_column.controls = [r["container"] for r in self._worker_rows]
+        self.update()
     
     def show(self, total: int = 0):
         """Show the panel and reset state."""

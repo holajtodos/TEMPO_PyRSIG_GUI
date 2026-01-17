@@ -18,6 +18,7 @@ from .ui.pages.export import ExportPage
 from .ui.pages.workspace import WorkspacePage
 from .ui.pages.settings import SettingsPage
 from .ui.pages.batch_import import BatchImportPage
+from .ui.pages.ai_analysis import AIAnalysisPage
 from .storage.database import Database
 from .core.status import get_status_manager
 from .core.config import ConfigManager
@@ -141,6 +142,9 @@ class App:
                 config=self.config,
                 on_restart_request=self._show_restart_dialog
             )
+        elif base_route == "/ai":
+            # AI Analysis page - Natural Language chart generation
+            content = AIAnalysisPage(db=self.db, data_dir=self.data_dir)
         elif base_route == "/export":
             content = ExportPage(db=self.db, data_dir=self.data_dir, dataset_id=route_param)
         # Legacy routes (keep for backward compatibility during transition)

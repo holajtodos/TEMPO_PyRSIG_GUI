@@ -91,6 +91,14 @@ class DataProcessor:
 
     @staticmethod
     def save_processed(dataset: xr.Dataset, output_path: Path):
-        """Save processed dataset to NetCDF."""
+        """Save processed dataset to NetCDF and generate schema for fast AI loading."""
         dataset.to_netcdf(output_path)
+        
+        # Generate and save schema for fast AI Analysis loading
+        try:
+            from .df_converter import DataFrameConverter
+            DataFrameConverter.save_schema(output_path)
+            logger.info(f"Saved schema: {output_path.with_suffix('.schema.json')}")
+        except Exception as e:
+            logger.warning(f"Could not save schema: {e}")
 

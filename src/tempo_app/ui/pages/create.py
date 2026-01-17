@@ -1517,6 +1517,9 @@ class CreatePage(ft.Container):
             self._status_log.add_info(f"📡 Downloading {len(granules)} granules...")
             
             # Show worker progress panel
+            # Update workers count based on current config
+            num_workers = self.config.download_workers if self.config else 4
+            self._worker_progress.set_workers(num_workers)
             self._worker_progress.show(total=len(granules))
             self.update()
             

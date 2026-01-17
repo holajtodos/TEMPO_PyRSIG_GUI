@@ -113,6 +113,7 @@ class RSIGDownloader:
         
         logger.info(f"[BATCH] Downloading {self._total} days with {self.max_concurrent} parallel workers")
         
+        
         # Use configured API key or anonymous
         api_key = self.api_key if self.api_key else "anonymous"
         
@@ -215,9 +216,13 @@ class RSIGDownloader:
             edate = d_obj + pd.to_timedelta(max_hour, unit='h') + pd.to_timedelta('59m')
             
             logger.info(f"[BATCH] Requesting NO2: {bdate} to {edate}")
+            if status: status.emit("info", f"Requesting NO2: {d_str}")
+
             no2ds = api.to_ioapi('tempo.l2.no2.vertical_column_troposphere', bdate=bdate, edate=edate)
             
             logger.info(f"[BATCH] Requesting HCHO: {bdate} to {edate}")
+            if status: status.emit("info", f"Requesting HCHO: {d_str}")
+
             hchods = api.to_ioapi('tempo.l2.hcho.vertical_column', bdate=bdate, edate=edate)
             
             return no2ds, hchods
@@ -236,6 +241,7 @@ class RSIGDownloader:
             error_str = str(e)
             if "Unknown file format" in error_str or "NetCDF: Unknown file format" in error_str:
                 logger.info(f"[BATCH] No data available for {d_str}")
+                if status: status.emit("warning", f"No data for {d_str}")
                 return []
             raise
         
@@ -314,6 +320,10 @@ class RSIGDownloader:
                 if fsize > 1000:
                     saved.append(filepath)
                     logger.info(f"[BATCH] Saved: {filename} ({fsize/1024:.1f} KB)")
+                    if status:
+                         # Calculate progress within this batch function is tricky, 
+                         # but we can at least show the success message in the log
+                         status.emit("download", f"✅ Saved: {filename}", None) 
                 else:
                     filepath.unlink()
                     
@@ -353,6 +363,7 @@ class RSIGDownloader:
         # Delete existing file if present
         if filepath.exists():
             logger.info(f"[SAVE] Deleting existing file: {filepath}")
+            if status: status.emit("info", f"🗑️ Overwriting {filename}")
             gc.collect()
             try:
                 filepath.unlink()

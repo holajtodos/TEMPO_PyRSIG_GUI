@@ -13,7 +13,7 @@ import uuid
 
 from .models import (
     Dataset, Granule, ExportRecord, Site, DatasetStatus, BoundingBox, SITES,
-    BatchJob, BatchSite, BatchJobStatus, BatchSiteStatus
+    BatchJob, BatchSite, BatchJobStatus, BatchSiteStatus, Analysis
 )
 
 
@@ -198,6 +198,23 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_exports_dataset ON exports(dataset_id);
                 CREATE INDEX IF NOT EXISTS idx_batch_sites_job ON batch_sites(batch_job_id);
                 CREATE INDEX IF NOT EXISTS idx_batch_sites_status ON batch_sites(status);
+
+                -- Analyses table (for AI-generated chart analyses)
+                CREATE TABLE IF NOT EXISTS analyses (
+                    id TEXT PRIMARY KEY,
+                    dataset_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    plot_path TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
+                    error_message TEXT,
+                    FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_analyses_dataset ON analyses(dataset_id);
+                CREATE INDEX IF NOT EXISTS idx_analyses_created ON analyses(created_at DESC);
             """)
 
             # Run migrations for existing databases
@@ -903,4 +920,73 @@ class Database:
             started_at=row["started_at"],
             completed_at=row["completed_at"],
             sequence_number=row["sequence_number"],
+        )
+
+    # ==========================================================================
+    # Analysis Operations (AI Chart Generation)
+    # ==========================================================================
+
+    def save_analysis(self, analysis: Analysis) -> None:
+        """Save or update an analysis record."""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO analyses
+                (id, dataset_id, name, query, code, plot_path, created_at, updated_at, error_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                analysis.id,
+                analysis.dataset_id,
+                analysis.name,
+                analysis.query,
+                analysis.code,
+                analysis.plot_path,
+                analysis.created_at,
+                analysis.updated_at,
+                analysis.error_message
+            ))
+
+    def get_analyses_for_dataset(self, dataset_id: str) -> list[Analysis]:
+        """Retrieve all analyses for a dataset, newest first."""
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT id, dataset_id, name, query, code, plot_path,
+                       created_at, updated_at, error_message
+                FROM analyses
+                WHERE dataset_id = ?
+                ORDER BY created_at DESC
+            """, (dataset_id,)).fetchall()
+            return [self._row_to_analysis(row) for row in rows]
+
+    def get_analysis(self, analysis_id: str) -> Optional[Analysis]:
+        """Retrieve a specific analysis by ID."""
+        with self._get_connection() as conn:
+            row = conn.execute("""
+                SELECT id, dataset_id, name, query, code, plot_path,
+                       created_at, updated_at, error_message
+                FROM analyses WHERE id = ?
+            """, (analysis_id,)).fetchone()
+            return self._row_to_analysis(row) if row else None
+
+    def delete_analysis(self, analysis_id: str) -> None:
+        """Delete an analysis and its plot file."""
+        analysis = self.get_analysis(analysis_id)
+        if analysis:
+            plot_path = Path(analysis.plot_path)
+            if plot_path.exists():
+                plot_path.unlink()
+            with self._get_connection() as conn:
+                conn.execute("DELETE FROM analyses WHERE id = ?", (analysis_id,))
+
+    def _row_to_analysis(self, row: sqlite3.Row) -> Analysis:
+        """Convert a database row to an Analysis object."""
+        return Analysis(
+            id=row[0],
+            dataset_id=row[1],
+            name=row[2],
+            query=row[3],
+            code=row[4],
+            plot_path=row[5],
+            created_at=row[6] if isinstance(row[6], datetime) else datetime.fromisoformat(row[6]),
+            updated_at=row[7] if isinstance(row[7], datetime) else datetime.fromisoformat(row[7]),
+            error_message=row[8]
         )
