@@ -37,7 +37,7 @@ It provides an intuitive interface for researchers and data scientists to downlo
 1.  **Clone the repository:**
     ```bash
     git clone https://github.com/pi3123/TEMPO_PyRSIG_GUI.git
-    cd tempo-analyzer
+    cd TEMPO_PyRSIG_GUI
     ```
 
 2.  **Create a virtual environment (Recommended):**
