@@ -57,6 +57,121 @@ It provides an intuitive interface for researchers and data scientists to downlo
     pip install -r requirements.txt
     ```
 
+## Updating the Repository
+
+After cloning the repository, you'll want to keep your local copy up-to-date with the latest changes. Here's how to fetch and apply updates:
+
+### Checking for Updates
+
+Before pulling updates, it's good practice to first **fetch** the latest changes from the remote repository. This downloads the updates without modifying your local files:
+
+```bash
+git fetch origin
+```
+
+To see what changes are available, compare your local branch with the remote:
+
+```bash
+# See a summary of commits you're behind
+git log HEAD..origin/main --oneline
+
+# Or see detailed differences
+git diff HEAD origin/main
+```
+
+### Pulling Updates
+
+Once you've reviewed the available changes (or if you just want to update), pull the latest code:
+
+```bash
+# Ensure you're on the main branch
+git checkout main
+
+# Pull the latest changes
+git pull origin main
+```
+
+This command fetches and merges the latest changes from the remote `main` branch into your local `main` branch.
+
+### Handling Local Modifications
+
+If you have uncommitted local changes that conflict with incoming updates, Git will prevent the pull. You have several options:
+
+**Option 1: Stash your changes temporarily**
+```bash
+# Save your local changes
+git stash
+
+# Pull the updates
+git pull origin main
+
+# Restore your local changes
+git stash pop
+```
+
+**Option 2: Commit your changes first**
+```bash
+# Stage and commit your changes
+git add .
+git commit -m "My local changes"
+
+# Then pull (may require merge resolution)
+git pull origin main
+```
+
+**Option 3: Discard local changes (use with caution!)**
+```bash
+# This will PERMANENTLY delete uncommitted changes
+git checkout -- .
+git pull origin main
+```
+
+### Updating Dependencies
+
+After pulling updates, it's important to check if any dependencies have changed:
+
+```bash
+cd src
+pip install -r requirements.txt --upgrade
+```
+
+### Quick Update Workflow
+
+For a typical update session, run these commands in sequence:
+
+```bash
+# Navigate to your project directory
+cd TEMPO_PyRSIG_GUI
+
+# Fetch and pull the latest changes
+git pull origin main
+
+# Update dependencies (if requirements.txt changed)
+cd src
+pip install -r requirements.txt --upgrade
+```
+
+### Syncing a Forked Repository
+
+If you've forked this repository and want to sync with the original (upstream):
+
+1.  **Add the upstream remote (one-time setup):**
+    ```bash
+    git remote add upstream https://github.com/pi3123/TEMPO_PyRSIG_GUI.git
+    ```
+
+2.  **Fetch and merge upstream changes:**
+    ```bash
+    git fetch upstream
+    git checkout main
+    git merge upstream/main
+    ```
+
+3.  **Push updates to your fork:**
+    ```bash
+    git push origin main
+    ```
+
 ## Usage
 
 ### Running the Application
