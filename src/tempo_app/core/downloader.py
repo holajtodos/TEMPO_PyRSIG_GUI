@@ -299,12 +299,16 @@ class RSIGDownloader:
                 
                 n_var = no2_hour.get('NO2_VERTICAL_CO', xr.DataArray(np.nan))
                 h_var = hcho_hour.get('VERTICAL_COLUMN', xr.DataArray(np.nan))
-                
+
                 if 'LAY' in n_var.dims: n_var = n_var.isel(LAY=0)
                 if 'LAY' in h_var.dims: h_var = h_var.isel(LAY=0)
                 if 'TSTEP' in n_var.dims: n_var = n_var.mean(dim='TSTEP')
                 if 'TSTEP' in h_var.dims: h_var = h_var.mean(dim='TSTEP')
-                
+
+                # Mask fill values (typically -9.999e36) as NaN
+                n_var = n_var.where(n_var > -1e30, np.nan)
+                h_var = h_var.where(h_var > -1e30, np.nan)
+
                 outds['NO2_TropVCD'] = xr.DataArray(n_var.values.copy(), dims=n_var.dims, attrs=dict(n_var.attrs) if hasattr(n_var, 'attrs') else {})
                 outds['HCHO_TotVCD'] = xr.DataArray(h_var.values.copy(), dims=h_var.dims, attrs=dict(h_var.attrs) if hasattr(h_var, 'attrs') else {})
                 

@@ -65,8 +65,9 @@ class DataProcessor:
             
             # Calculate FNR (HCHO / NO2)
             # Filter low NO2 to avoid division by zero or noise
+            # Also filter out fill values (typically -9.999e36)
             combined['FNR'] = xr.where(
-                (combined['NO2_TropVCD'] > 1e-12) & (combined['HCHO_TotVCD'] > -9e30),
+                (combined['NO2_TropVCD'] > 1e-12) & (combined['HCHO_TotVCD'] > -1e30),
                 combined['HCHO_TotVCD'] / combined['NO2_TropVCD'],
                 np.nan
             )

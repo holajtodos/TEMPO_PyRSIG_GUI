@@ -145,14 +145,18 @@ class MapPlotter:
                 data = data.where(data > 0)
             elif variable == 'NO2':
                 data = ds_hour['NO2_TropVCD']
+                # Mask fill values (typically -9.999e36)
+                data = data.where(data > -1e30)
                 cmap = colormap if colormap else 'viridis'
                 norm = Normalize(vmin=vmin, vmax=vmax) if (vmin is not None or vmax is not None) else None
-                label = 'NO2 Trop VCD'
+                label = 'NO2 Trop VCD (molecules/cm²)'
             elif variable == 'HCHO':
                 data = ds_hour['HCHO_TotVCD']
+                # Mask fill values (typically -9.999e36)
+                data = data.where(data > -1e30)
                 cmap = colormap if colormap else 'magma'
                 norm = Normalize(vmin=vmin, vmax=vmax) if (vmin is not None or vmax is not None) else None
-                label = 'HCHO Total VCD'
+                label = 'HCHO Total VCD (molecules/cm²)'
             else:
                 return None
                 
