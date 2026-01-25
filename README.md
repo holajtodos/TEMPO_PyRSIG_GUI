@@ -36,8 +36,8 @@ It provides an intuitive interface for researchers and data scientists to downlo
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/tempo-analyzer.git
-    cd tempo-analyzer
+    git clone https://github.com/pi3123/TEMPO_PyRSIG_GUI.git
+    cd TEMPO_PyRSIG_GUI
     ```
 
 2.  **Create a virtual environment (Recommended):**
@@ -53,6 +53,7 @@ It provides an intuitive interface for researchers and data scientists to downlo
 
 3.  **Install dependencies:**
     ```bash
+    cd src
     pip install -r requirements.txt
     ```
 
@@ -63,6 +64,7 @@ It provides an intuitive interface for researchers and data scientists to downlo
 To start the application, run the main module from the root directory:
 
 ```bash
+cd src
 python -m tempo_app.main
 ```
 
