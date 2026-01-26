@@ -5,6 +5,7 @@ Handles all CRUD operations for datasets, granules, and exports.
 
 import sqlite3
 import json
+import logging
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,8 @@ from .models import (
     Dataset, Granule, ExportRecord, Site, DatasetStatus, BoundingBox, SITES,
     BatchJob, BatchSite, BatchJobStatus, BatchSiteStatus, Analysis
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_date(value) -> date:
@@ -97,6 +100,7 @@ class Database:
                     hour_filter TEXT NOT NULL,
                     max_cloud REAL NOT NULL,
                     max_sza REAL NOT NULL,
+                    selected_variables TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     file_path TEXT,
                     file_hash TEXT,
@@ -123,8 +127,10 @@ class Database:
                     content_hash TEXT,
                     no2_valid_pixels INTEGER DEFAULT 0,
                     hcho_valid_pixels INTEGER DEFAULT 0,
+                    o3_valid_pixels INTEGER DEFAULT 0,
                     no2_mean REAL,
                     hcho_mean REAL,
+                    o3_mean REAL,
                     file_path TEXT,
                     file_size_bytes INTEGER DEFAULT 0,
                     UNIQUE(dataset_id, date, hour)
@@ -215,6 +221,15 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_analyses_dataset ON analyses(dataset_id);
                 CREATE INDEX IF NOT EXISTS idx_analyses_created ON analyses(created_at DESC);
+
+                -- Discovered Variables table (cache for auto-discovered variable names)
+                CREATE TABLE IF NOT EXISTS discovered_variables (
+                    product_id TEXT PRIMARY KEY,
+                    netcdf_var TEXT NOT NULL,
+                    discovered_at TIMESTAMP NOT NULL,
+                    verified BOOLEAN DEFAULT 0,
+                    notes TEXT
+                );
             """)
 
             # Run migrations for existing databases
@@ -228,6 +243,21 @@ class Database:
 
         if "batch_job_id" not in columns:
             conn.execute("ALTER TABLE datasets ADD COLUMN batch_job_id TEXT")
+
+        # Check if selected_variables column exists in datasets table
+        if "selected_variables" not in columns:
+            conn.execute("ALTER TABLE datasets ADD COLUMN selected_variables TEXT")
+            logger.info("Added selected_variables column to datasets table")
+
+        # Check if O3 columns exist in granules table
+        cursor = conn.execute("PRAGMA table_info(granules)")
+        granule_columns = [row[1] for row in cursor.fetchall()]
+
+        if "o3_valid_pixels" not in granule_columns:
+            conn.execute("ALTER TABLE granules ADD COLUMN o3_valid_pixels INTEGER DEFAULT 0")
+
+        if "o3_mean" not in granule_columns:
+            conn.execute("ALTER TABLE granules ADD COLUMN o3_mean REAL")
 
     # ==========================================================================
     # Dataset Operations
@@ -243,15 +273,16 @@ class Database:
                 INSERT INTO datasets (
                     id, name, batch_job_id, created_at, bbox_west, bbox_south, bbox_east, bbox_north,
                     date_start, date_end, day_filter, hour_filter, max_cloud, max_sza,
-                    status, file_path, file_hash, file_size_mb, last_accessed,
+                    selected_variables, status, file_path, file_hash, file_size_mb, last_accessed,
                     granule_count, granules_downloaded
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 dataset.id, dataset.name, dataset.batch_job_id, dataset.created_at,
                 dataset.bbox.west, dataset.bbox.south, dataset.bbox.east, dataset.bbox.north,
                 dataset.date_start, dataset.date_end,
                 json.dumps(dataset.day_filter), json.dumps(dataset.hour_filter),
                 dataset.max_cloud, dataset.max_sza,
+                json.dumps(dataset.selected_variables) if dataset.selected_variables else None,
                 dataset.status.value, dataset.file_path, dataset.file_hash, dataset.file_size_mb,
                 dataset.last_accessed, dataset.granule_count, dataset.granules_downloaded
             ))
@@ -287,12 +318,15 @@ class Database:
             conn.execute("""
                 UPDATE datasets SET
                     name = ?, status = ?, file_path = ?, file_hash = ?, file_size_mb = ?,
-                    last_accessed = ?, granule_count = ?, granules_downloaded = ?
+                    last_accessed = ?, granule_count = ?, granules_downloaded = ?,
+                    selected_variables = ?
                 WHERE id = ?
             """, (
                 dataset.name, dataset.status.value, dataset.file_path, dataset.file_hash,
                 dataset.file_size_mb, dataset.last_accessed, dataset.granule_count,
-                dataset.granules_downloaded, dataset.id
+                dataset.granules_downloaded,
+                json.dumps(dataset.selected_variables) if dataset.selected_variables else None,
+                dataset.id
             ))
     
     def delete_dataset(self, dataset_id: str) -> None:
@@ -351,11 +385,19 @@ class Database:
     
     def _row_to_dataset(self, row: sqlite3.Row) -> Dataset:
         """Convert a database row to a Dataset object."""
+        # Parse selected_variables if present
+        selected_variables = None
+        if "selected_variables" in row.keys() and row["selected_variables"]:
+            try:
+                selected_variables = json.loads(row["selected_variables"])
+            except (json.JSONDecodeError, TypeError):
+                selected_variables = None
+
         return Dataset(
             id=row["id"],
             name=row["name"],
             batch_job_id=row["batch_job_id"] if "batch_job_id" in row.keys() else None,
-            created_at=row["created_at"] if isinstance(row["created_at"], datetime) 
+            created_at=row["created_at"] if isinstance(row["created_at"], datetime)
                        else datetime.fromisoformat(row["created_at"]),
             bbox=BoundingBox(
                 row["bbox_west"], row["bbox_south"], row["bbox_east"], row["bbox_north"]
@@ -366,6 +408,7 @@ class Database:
             hour_filter=json.loads(row["hour_filter"]),
             max_cloud=row["max_cloud"],
             max_sza=row["max_sza"],
+            selected_variables=selected_variables,  # NEW
             status=DatasetStatus(row["status"]),
             file_path=row["file_path"],
             file_hash=row["file_hash"],
@@ -390,15 +433,15 @@ class Database:
                 INSERT INTO granules (
                     dataset_id, date, hour, bbox_west, bbox_south, bbox_east, bbox_north,
                     max_cloud, max_sza, downloaded, downloaded_at, content_hash,
-                    no2_valid_pixels, hcho_valid_pixels, no2_mean, hcho_mean,
+                    no2_valid_pixels, hcho_valid_pixels, o3_valid_pixels, no2_mean, hcho_mean, o3_mean,
                     file_path, file_size_bytes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 granule.dataset_id, granule.date, granule.hour,
                 granule.bbox_west, granule.bbox_south, granule.bbox_east, granule.bbox_north,
                 granule.max_cloud, granule.max_sza, granule.downloaded, granule.downloaded_at,
-                granule.content_hash, granule.no2_valid_pixels, granule.hcho_valid_pixels,
-                granule.no2_mean, granule.hcho_mean, granule.file_path, granule.file_size_bytes
+                granule.content_hash, granule.no2_valid_pixels, granule.hcho_valid_pixels, granule.o3_valid_pixels,
+                granule.no2_mean, granule.hcho_mean, granule.o3_mean, granule.file_path, granule.file_size_bytes
             ))
             granule.id = cursor.lastrowid
         return granule
@@ -414,16 +457,16 @@ class Database:
                 INSERT OR IGNORE INTO granules (
                     dataset_id, date, hour, bbox_west, bbox_south, bbox_east, bbox_north,
                     max_cloud, max_sza, downloaded, downloaded_at, content_hash,
-                    no2_valid_pixels, hcho_valid_pixels, no2_mean, hcho_mean,
+                    no2_valid_pixels, hcho_valid_pixels, o3_valid_pixels, no2_mean, hcho_mean, o3_mean,
                     file_path, file_size_bytes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 (
                     g.dataset_id, g.date, g.hour,
                     g.bbox_west, g.bbox_south, g.bbox_east, g.bbox_north,
                     g.max_cloud, g.max_sza, g.downloaded, g.downloaded_at,
-                    g.content_hash, g.no2_valid_pixels, g.hcho_valid_pixels,
-                    g.no2_mean, g.hcho_mean, g.file_path, g.file_size_bytes
+                    g.content_hash, g.no2_valid_pixels, g.hcho_valid_pixels, g.o3_valid_pixels,
+                    g.no2_mean, g.hcho_mean, g.o3_mean, g.file_path, g.file_size_bytes
                 )
                 for g in granules
             ])
@@ -461,12 +504,12 @@ class Database:
             conn.execute("""
                 UPDATE granules SET
                     downloaded = ?, downloaded_at = ?, no2_valid_pixels = ?,
-                    hcho_valid_pixels = ?, no2_mean = ?, hcho_mean = ?,
+                    hcho_valid_pixels = ?, o3_valid_pixels = ?, no2_mean = ?, hcho_mean = ?, o3_mean = ?,
                     file_path = ?, file_size_bytes = ?
                 WHERE id = ?
             """, (
                 granule.downloaded, granule.downloaded_at, granule.no2_valid_pixels,
-                granule.hcho_valid_pixels, granule.no2_mean, granule.hcho_mean,
+                granule.hcho_valid_pixels, granule.o3_valid_pixels, granule.no2_mean, granule.hcho_mean, granule.o3_mean,
                 granule.file_path, granule.file_size_bytes, granule.id
             ))
     
@@ -498,8 +541,10 @@ class Database:
             content_hash=row["content_hash"],
             no2_valid_pixels=row["no2_valid_pixels"] or 0,
             hcho_valid_pixels=row["hcho_valid_pixels"] or 0,
+            o3_valid_pixels=row["o3_valid_pixels"] if "o3_valid_pixels" in row.keys() else 0,
             no2_mean=row["no2_mean"],
             hcho_mean=row["hcho_mean"],
+            o3_mean=row["o3_mean"] if "o3_mean" in row.keys() else None,
             file_path=row["file_path"],
             file_size_bytes=row["file_size_bytes"] or 0,
         )
@@ -990,3 +1035,76 @@ class Database:
             updated_at=row[7] if isinstance(row[7], datetime) else datetime.fromisoformat(row[7]),
             error_message=row[8]
         )
+
+    # ==========================================================================
+    # Discovered Variables Operations (Variable Name Cache)
+    # ==========================================================================
+
+    def get_cached_variable(self, product_id: str) -> Optional[str]:
+        """Get cached variable name from database.
+
+        Args:
+            product_id: TEMPO product ID (e.g., "tempo.l2.no2.vertical_column_troposphere")
+
+        Returns:
+            netcdf_var if found in cache, None otherwise
+        """
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT netcdf_var FROM discovered_variables WHERE product_id = ?",
+                (product_id,)
+            ).fetchone()
+            return row["netcdf_var"] if row else None
+
+    def cache_discovered_variable(self, product_id: str, netcdf_var: str, verified: bool = False, notes: str = None):
+        """Cache discovered variable name to database.
+
+        Args:
+            product_id: TEMPO product ID
+            netcdf_var: Discovered NetCDF variable name
+            verified: Whether this discovery has been human-verified
+            notes: Optional notes about the discovery
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO discovered_variables
+                (product_id, netcdf_var, discovered_at, verified, notes)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (product_id, netcdf_var, datetime.now(), verified, notes)
+            )
+
+    def get_all_discovered_variables(self) -> list[dict]:
+        """Get all discovered variables for review/management.
+
+        Returns:
+            List of dicts with keys: product_id, netcdf_var, discovered_at, verified, notes
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT product_id, netcdf_var, discovered_at, verified, notes FROM discovered_variables ORDER BY discovered_at DESC"
+            ).fetchall()
+            return [
+                {
+                    "product_id": row["product_id"],
+                    "netcdf_var": row["netcdf_var"],
+                    "discovered_at": row["discovered_at"],
+                    "verified": bool(row["verified"]),
+                    "notes": row["notes"]
+                }
+                for row in rows
+            ]
+
+    def mark_variable_verified(self, product_id: str, verified: bool = True):
+        """Mark a discovered variable as verified (or unverified).
+
+        Args:
+            product_id: TEMPO product ID
+            verified: True to mark as verified, False to mark as unverified
+        """
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE discovered_variables SET verified = ? WHERE product_id = ?",
+                (verified, product_id)
+            )

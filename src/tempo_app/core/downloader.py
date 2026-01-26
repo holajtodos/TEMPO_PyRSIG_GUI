@@ -29,7 +29,7 @@ DOWNLOAD_TIMEOUT = 180.0      # Timeout per granule in seconds
 
 def format_duration(seconds: float) -> str:
     """Format duration in human-readable format.
-    
+
     Returns:
         < 60s: "45s"
         1m - 60m: "2m 30s"
@@ -37,9 +37,9 @@ def format_duration(seconds: float) -> str:
     """
     if seconds < 0:
         return "calculating..."
-    
+
     seconds = int(seconds)
-    
+
     if seconds < 60:
         return f"{seconds}s"
     elif seconds < 3600:
@@ -49,6 +49,103 @@ def format_duration(seconds: float) -> str:
         h, remainder = divmod(seconds, 3600)
         m = remainder // 60
         return f"{h}h {m}m" if m else f"{h}h"
+
+
+def _get_variable_name(ds: xr.Dataset, var_meta, product_id: str) -> str:
+    """Get variable name with strict validation and 3-tier fallback.
+
+    Order of precedence:
+    1. Registered netcdf_var (validated, instant) - FAST PATH
+    2. Cached discovery (from database) - MEDIUM PATH
+    3. Safe auto-discovery (with validation) - SLOW PATH
+    4. ERROR if ambiguous or not found
+
+    Args:
+        ds: xarray Dataset
+        var_meta: TempoVariable metadata
+        product_id: TEMPO product ID
+
+    Returns:
+        Actual variable name in dataset
+
+    Raises:
+        ValueError: If variable cannot be determined safely
+    """
+    # FAST PATH: Use registered name
+    if var_meta.netcdf_var and var_meta.netcdf_var in ds.data_vars:
+        logger.debug(f"[VAR] Using registered: {var_meta.netcdf_var}")
+        return var_meta.netcdf_var
+
+    # MEDIUM PATH: Check cache
+    from ..storage.database import Database
+    db = Database(Path("data/tempo.db"))
+    cached = db.get_cached_variable(product_id)
+    if cached and cached in ds.data_vars:
+        logger.info(f"[VAR] Using cached: {cached}")
+        return cached
+
+    # SLOW PATH: Safe discovery with validation
+    logger.warning(f"[VAR] Attempting discovery for {product_id}")
+    candidates = _discover_variable_candidates(ds, product_id)
+
+    if len(candidates) == 0:
+        raise ValueError(
+            f"No data variables found for {product_id}. "
+            f"Available: {list(ds.data_vars)}"
+        )
+
+    if len(candidates) == 1:
+        discovered = candidates[0]
+        logger.warning(f"[VAR] AUTO-DISCOVERED: {product_id} → {discovered}")
+        logger.warning(f"[VAR] Action Required: Update variable_registry.py:")
+        logger.warning(f"[VAR]   netcdf_var='{discovered}'")
+
+        # Cache for future use
+        db.cache_discovered_variable(product_id, discovered, verified=False)
+        return discovered
+
+    # AMBIGUOUS: Multiple candidates - require manual intervention
+    logger.error(f"[VAR] AMBIGUOUS: {product_id}")
+    logger.error(f"[VAR] Multiple candidates found: {candidates}")
+    logger.error(f"[VAR] Action Required: Update variable_registry.py with correct variable:")
+    for i, candidate in enumerate(candidates, 1):
+        logger.error(f"[VAR]   Option {i}: netcdf_var='{candidate}'")
+
+    raise ValueError(
+        f"Ambiguous variable discovery for {product_id}. "
+        f"Found {len(candidates)} candidates: {candidates}. "
+        f"Manual update to variable_registry.py required."
+    )
+
+
+def _discover_variable_candidates(ds: xr.Dataset, product_id: str) -> list[str]:
+    """Find ALL potential data variables (no guessing).
+
+    Returns:
+        List of candidate variable names (may be empty or have multiple)
+    """
+    # Exclude known metadata variables
+    metadata_vars = {
+        'TFLAG', 'LONGITUDE', 'LATITUDE', 'COUNT',
+        'ROW', 'COL', 'LAY', 'TSTEP', 'VAR', 'DATE-TIME'
+    }
+
+    # Exclude quality/uncertainty variables (usually not the main data)
+    exclude_patterns = ['FLAG', 'UNCERTAINTY', 'ERROR', 'PRECISION', 'QUALITY']
+
+    candidates = []
+    for var in ds.data_vars:
+        # Skip metadata
+        if var in metadata_vars:
+            continue
+
+        # Skip quality variables
+        if any(pattern in var.upper() for pattern in exclude_patterns):
+            continue
+
+        candidates.append(var)
+
+    return candidates
 
 
 
@@ -68,20 +165,21 @@ class RSIGDownloader:
         self._total = 0
         self._lock = asyncio.Lock()
         
-    async def download_granules(self, 
-                              dates: list[str], 
-                              hours: list[int], 
-                              bbox: list[float], 
+    async def download_granules(self,
+                              dates: list[str],
+                              hours: list[int],
+                              bbox: list[float],
                               dataset_name: str,
-                              max_cloud: float = 0.5, 
+                              max_cloud: float = 0.5,
                               max_sza: float = 70.0,
+                              selected_variables: list[str] = None,
                               status: StatusManager = None) -> list[Path]:
         """
         Download TEMPO granules using daily batch requests with controlled parallelism.
-        
+
         This approach uses daily batches (instead of per-hour) to reduce server load,
         while still allowing parallel processing of multiple days for speed.
-        
+
         Args:
             dates: List of date strings (YYYY-MM-DD)
             hours: List of UTC hours (0-23)
@@ -89,11 +187,16 @@ class RSIGDownloader:
             dataset_name: Name of the dataset (for file naming)
             max_cloud: Maximum cloud fraction (0-1)
             max_sza: Maximum solar zenith angle (deg)
+            selected_variables: List of TEMPO product IDs to download (NEW)
             status: StatusManager for UI updates
-        
+
         Returns:
             List of paths to downloaded .nc files
         """
+        # Default to legacy 3 variables if not specified
+        if selected_variables is None:
+            from .variable_registry import VariableRegistry
+            selected_variables = VariableRegistry.get_default_variables()
         if RsigApi is None:
             if status: status.emit("error", "pyrsig library not installed!")
             return await self._simulate_download(dates, hours, dataset_name, status)
@@ -148,7 +251,7 @@ class RSIGDownloader:
                     
                     # Download entire day in one request
                     result = await self._download_daily_batch(
-                        api, d_str, min_hour, max_hour, hours, dataset_dir, status
+                        api, d_str, min_hour, max_hour, hours, dataset_dir, selected_variables, status
                     )
                     
                     async with self._lock:
@@ -200,37 +303,65 @@ class RSIGDownloader:
         max_hour: int,
         hours: list[int],
         dataset_dir: Path,
+        selected_variables: list[str],
         status: StatusManager
     ) -> list[Path]:
         """Download an entire day's worth of data in one request.
-        
+
         Uses a persistent API session to maintain connection and reduce overhead.
         Splits the returned data into per-hour files for consistent processing.
         """
         logger.info(f"[BATCH] Fetching day {d_str} (hours {min_hour:02d}-{max_hour:02d})")
-        
+
         def _fetch_day():
-            """Synchronous fetch for entire day range."""
+            """Synchronous fetch for entire day range - DYNAMIC VARIABLES."""
+            from .variable_registry import VariableRegistry
+
             d_obj = pd.to_datetime(d_str)
             bdate = d_obj + pd.to_timedelta(min_hour, unit='h')
             edate = d_obj + pd.to_timedelta(max_hour, unit='h') + pd.to_timedelta('59m')
-            
-            logger.info(f"[BATCH] Requesting NO2: {bdate} to {edate}")
-            if status: status.emit("info", f"Requesting NO2: {d_str}")
 
-            no2ds = api.to_ioapi('tempo.l2.no2.vertical_column_troposphere', bdate=bdate, edate=edate)
-            
-            logger.info(f"[BATCH] Requesting HCHO: {bdate} to {edate}")
-            if status: status.emit("info", f"Requesting HCHO: {d_str}")
+            # Get variable metadata
+            registry = VariableRegistry.discover_variables()
+            var_map = {v.product_id: v for v in registry}
 
-            hchods = api.to_ioapi('tempo.l2.hcho.vertical_column', bdate=bdate, edate=edate)
-            
-            return no2ds, hchods
+            datasets_dict = {}  # {product_id: xarray.Dataset}
+
+            # Download each selected variable
+            for product_id in selected_variables:
+                var_meta = var_map.get(product_id)
+                if not var_meta:
+                    logger.warning(f"[BATCH] Unknown variable: {product_id}, skipping")
+                    continue
+
+                logger.info(f"[BATCH] Requesting {var_meta.display_name}: {bdate} to {edate}")
+                if status:
+                    status.emit("info", f"Requesting {var_meta.display_name}: {d_str}")
+
+                try:
+                    ds = api.to_ioapi(product_id, bdate=bdate, edate=edate)
+                    datasets_dict[product_id] = ds
+                    logger.info(f"[BATCH] Successfully fetched {var_meta.display_name}")
+                    # Debug: Log available variables in dataset
+                    logger.debug(f"[BATCH] Available variables in {product_id}: {list(ds.data_vars)}")
+                except ValueError as e:
+                    # Variable discovery/validation error
+                    logger.error(f"[BATCH] Variable error for {product_id}: {e}")
+                    if status:
+                        status.emit("warning", f"⚠️ Variable error: {var_meta.display_name}")
+                    continue
+                except Exception as e:
+                    # Other errors (API, network, etc.)
+                    logger.error(f"[BATCH] Failed to fetch {product_id}: {e}")
+                    if status:
+                        status.emit("warning", f"⚠️ Failed: {var_meta.display_name}")
+
+            return datasets_dict
         
         try:
-            no2ds, hchods = await asyncio.wait_for(
+            datasets_dict = await asyncio.wait_for(
                 asyncio.to_thread(_fetch_day),
-                timeout=DOWNLOAD_TIMEOUT * 3  # Longer timeout for daily batches
+                timeout=DOWNLOAD_TIMEOUT * len(selected_variables)  # Scale timeout with variable count
             )
         except asyncio.TimeoutError:
             logger.error(f"[BATCH] Timeout fetching day {d_str}")
@@ -244,97 +375,140 @@ class RSIGDownloader:
                 if status: status.emit("warning", f"No data for {d_str}")
                 return []
             raise
+
+        # Check if we got any data
+        if not datasets_dict:
+            logger.warning(f"[BATCH] No datasets fetched for {d_str}")
+            if status:
+                status.emit("warning", f"⚠️ No data: {d_str}")
+            return []
         
         # Split into per-hour files for consistent downstream processing
         saved = []
-        
+
         try:
-            # Get timestamps from the response
-            if 'TSTEP' in no2ds.dims:
-                timestamps = pd.to_datetime(no2ds.TSTEP.values)
+            from .variable_registry import VariableRegistry
+
+            # Get variable metadata
+            registry = VariableRegistry.discover_variables()
+            var_map = {v.product_id: v for v in registry}
+
+            # Get timestamps from the first dataset
+            first_ds = next(iter(datasets_dict.values()))
+            if 'TSTEP' in first_ds.dims:
+                timestamps = pd.to_datetime(first_ds.TSTEP.values)
             else:
                 # Single timestep, just use requested hours
                 timestamps = [pd.to_datetime(d_str) + pd.to_timedelta(h, unit='h') for h in hours]
-            
+
             # Group data by hour
             for hour in hours:
                 # Check if this hour has data
                 hour_data_mask = [t.hour == hour for t in timestamps]
                 if not any(hour_data_mask):
                     continue
-                
+
                 filename = f"tempo_{d_str}_{hour:02d}.nc"
                 filepath = dataset_dir / filename
-                
-                # Extract data for this hour
-                if 'TSTEP' in no2ds.dims:
-                    hour_indices = [i for i, m in enumerate(hour_data_mask) if m]
-                    if not hour_indices:
-                        continue
-                    
-                    no2_hour = no2ds.isel(TSTEP=hour_indices)
-                    hcho_hour = hchods.isel(TSTEP=hour_indices) if 'TSTEP' in hchods.dims else hchods
-                else:
-                    no2_hour = no2ds
-                    hcho_hour = hchods
-                
-                # Create output dataset
-                outds = xr.Dataset(attrs=dict(no2ds.attrs))
-                
-                if 'LATITUDE' in no2_hour:
-                    lat_data = no2_hour['LATITUDE']
+
+                # Create output dataset with attributes from first dataset
+                outds = xr.Dataset(attrs=dict(first_ds.attrs))
+
+                # Extract LAT/LON coordinates from first dataset
+                if 'LATITUDE' in first_ds:
+                    lat_data = first_ds['LATITUDE']
                     if 'TSTEP' in lat_data.dims:
                         lat_data = lat_data.isel(TSTEP=0)
                     if 'LAY' in lat_data.dims:
                         lat_data = lat_data.isel(LAY=0)
                     outds.coords['LAT'] = (('ROW', 'COL'), lat_data.values.copy())
-                    
-                if 'LONGITUDE' in no2_hour:
-                    lon_data = no2_hour['LONGITUDE']
+
+                if 'LONGITUDE' in first_ds:
+                    lon_data = first_ds['LONGITUDE']
                     if 'TSTEP' in lon_data.dims:
                         lon_data = lon_data.isel(TSTEP=0)
                     if 'LAY' in lon_data.dims:
                         lon_data = lon_data.isel(LAY=0)
                     outds.coords['LON'] = (('ROW', 'COL'), lon_data.values.copy())
-                
-                n_var = no2_hour.get('NO2_VERTICAL_CO', xr.DataArray(np.nan))
-                h_var = hcho_hour.get('VERTICAL_COLUMN', xr.DataArray(np.nan))
 
-                if 'LAY' in n_var.dims: n_var = n_var.isel(LAY=0)
-                if 'LAY' in h_var.dims: h_var = h_var.isel(LAY=0)
-                if 'TSTEP' in n_var.dims: n_var = n_var.mean(dim='TSTEP')
-                if 'TSTEP' in h_var.dims: h_var = h_var.mean(dim='TSTEP')
+                # Extract each selected variable dynamically
+                all_nan = True
 
-                # Mask fill values (typically -9.999e36) as NaN
-                n_var = n_var.where(n_var > -1e30, np.nan)
-                h_var = h_var.where(h_var > -1e30, np.nan)
+                for product_id, ds in datasets_dict.items():
+                    var_meta = var_map.get(product_id)
+                    if not var_meta:
+                        logger.warning(f"[BATCH] No metadata for {product_id}, skipping")
+                        continue
 
-                outds['NO2_TropVCD'] = xr.DataArray(n_var.values.copy(), dims=n_var.dims, attrs=dict(n_var.attrs) if hasattr(n_var, 'attrs') else {})
-                outds['HCHO_TotVCD'] = xr.DataArray(h_var.values.copy(), dims=h_var.dims, attrs=dict(h_var.attrs) if hasattr(h_var, 'attrs') else {})
-                
-                # Check validity
-                if outds['NO2_TropVCD'].isnull().all() and outds['HCHO_TotVCD'].isnull().all():
+                    # Extract data for this hour
+                    if 'TSTEP' in ds.dims:
+                        hour_indices = [i for i, m in enumerate(hour_data_mask) if m]
+                        if not hour_indices:
+                            continue
+                        ds_hour = ds.isel(TSTEP=hour_indices)
+                    else:
+                        ds_hour = ds
+
+                    # Get validated variable name (uses 3-tier discovery)
+                    try:
+                        var_name = _get_variable_name(ds_hour, var_meta, product_id)
+                        var_data = ds_hour[var_name]
+                        logger.debug(f"[BATCH] Extracting {var_name} -> {var_meta.output_var} for hour {hour}")
+                    except ValueError as e:
+                        # Discovery failed or ambiguous
+                        logger.error(f"[BATCH] Failed to extract {product_id}: {e}")
+                        if status:
+                            status.emit("warning", f"⚠️ Variable error: {var_meta.display_name}")
+                        continue
+
+                    # Remove extra dimensions (LAY, TSTEP)
+                    if 'LAY' in var_data.dims:
+                        var_data = var_data.isel(LAY=0)
+                    if 'TSTEP' in var_data.dims:
+                        var_data = var_data.mean(dim='TSTEP')
+
+                    # Mask fill values (typically -9.999e36) as NaN
+                    var_data = var_data.where(var_data > -1e30, np.nan)
+
+                    # Store with standardized output name
+                    outds[var_meta.output_var] = xr.DataArray(
+                        var_data.values.copy(),
+                        dims=var_data.dims,
+                        attrs=dict(var_data.attrs) if hasattr(var_data, 'attrs') else {}
+                    )
+
+                    # Track if we have any valid data
+                    if not var_data.isnull().all():
+                        all_nan = False
+                    else:
+                        logger.debug(f"[BATCH] {var_meta.output_var} is all NaN for hour {hour}")
+
+                # Skip file if all variables are NaN
+                if all_nan:
+                    logger.info(f"[BATCH] Skipping {filename} - all variables are NaN")
                     continue
-                
+
                 # Save file
                 await asyncio.to_thread(lambda: outds.to_netcdf(filepath, engine='netcdf4', compute=True))
                 outds.close()
-                
+
                 fsize = filepath.stat().st_size
                 if fsize > 1000:
                     saved.append(filepath)
                     logger.info(f"[BATCH] Saved: {filename} ({fsize/1024:.1f} KB)")
                     if status:
-                         # Calculate progress within this batch function is tricky, 
-                         # but we can at least show the success message in the log
-                         status.emit("download", f"✅ Saved: {filename}", None) 
+                         status.emit("download", f"✅ Saved: {filename}", None)
                 else:
                     filepath.unlink()
-                    
+
         finally:
-            no2ds.close()
-            hchods.close()
-        
+            # Close all opened datasets
+            for ds in datasets_dict.values():
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+
         return saved
     
     async def _download_single_granule(

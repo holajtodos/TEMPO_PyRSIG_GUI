@@ -244,16 +244,21 @@ class DataExporter:
                 f'Local_Time (UTC{utc_offset:+.1f})': local_col,
             }
 
-            # Extract NO2 and HCHO interleaved for each cell
+            # Get available data variables (exclude coordinates and metadata)
+            data_vars = [v for v in dataset.data_vars if v not in ['LAT', 'LON', 'TFLAG']]
+
+            # Extract data for each cell
             for i, (r, c, dist) in enumerate(cells):
                 cell_num = i + 1
-                if 'NO2_TropVCD' in dataset:
-                    values = dataset['NO2_TropVCD'].isel(ROW=r, COL=c).values.flatten()
-                    # Keep NaN as empty, not -999
-                    data[f'Cell{cell_num}_NO2'] = values
-                if 'HCHO_TotVCD' in dataset:
-                    values = dataset['HCHO_TotVCD'].isel(ROW=r, COL=c).values.flatten()
-                    data[f'Cell{cell_num}_HCHO'] = values
+                for var_name in data_vars:
+                    try:
+                        values = dataset[var_name].isel(ROW=r, COL=c).values.flatten()
+                        # Create friendly column name (remove output prefix if present)
+                        # e.g., NO2_TropVCD -> NO2, HCHO_TotVCD -> HCHO
+                        col_name = var_name.split('_')[0] if '_' in var_name else var_name
+                        data[f'Cell{cell_num}_{col_name}'] = values
+                    except Exception as e:
+                        logger.warning(f"Failed to extract {var_name}: {e}")
 
             # Create hourly data DataFrame
             df = pd.DataFrame(data)
@@ -267,8 +272,9 @@ class DataExporter:
                 df['Month'] = 1  # Placeholder
                 df['Hour'] = [int(h) for h in time_values]
             
-            # Get value columns (NO2 and HCHO)
-            value_cols = [c for c in df.columns if '_NO2' in c or '_HCHO' in c]
+            # Get value columns (all data columns except time/month/hour)
+            exclude_cols = ['UTC_Time', 'Local_Time (UTC', 'Month', 'Hour']
+            value_cols = [c for c in df.columns if not any(exc in c for exc in exclude_cols)]
             
             # Create NoFill version (replace NaN with -999)
             df_nofill = df.copy()
@@ -312,23 +318,31 @@ class DataExporter:
                     meta_df = self._create_metadata_df(metadata)
                     # Calculate missing data stats for this site
                     total_pts = len(df)
-                    no2_missing = df.filter(like='_NO2').isna().sum().sum()
-                    no2_total = df.filter(like='_NO2').size
-                    hcho_missing = df.filter(like='_HCHO').isna().sum().sum()
-                    hcho_total = df.filter(like='_HCHO').size
-                    
-                    # Count fill values applied
-                    nofill_missing = (df_nofill_out.filter(like='_NO2') == MISSING_VALUE).sum().sum()
-                    fill_missing = (df_fill_out.filter(like='_NO2') == MISSING_VALUE).sum().sum()
-                    filled_count = nofill_missing - fill_missing
-                    
-                    stats_rows = pd.DataFrame([
+
+                    stats_rows = [
                         {'Parameter': 'Site', 'Value': site},
                         {'Parameter': 'Total_Time_Steps', 'Value': total_pts},
-                        {'Parameter': 'NO2_Missing_Pct', 'Value': f"{(no2_missing/no2_total)*100:.1f}%" if no2_total else "0%"},
-                        {'Parameter': 'HCHO_Missing_Pct', 'Value': f"{(hcho_missing/hcho_total)*100:.1f}%" if hcho_total else "0%"},
-                        {'Parameter': 'Fill_Applied_Count', 'Value': filled_count}
-                    ])
+                    ]
+
+                    # Calculate stats for each variable present
+                    for val_col_prefix in set([c.split('_')[1] if 'Cell' in c else c for c in value_cols]):
+                        var_cols = [c for c in value_cols if f'_{val_col_prefix}' in c]
+                        if var_cols:
+                            var_missing = df[var_cols].isna().sum().sum()
+                            var_total = df[var_cols].size
+                            stats_rows.append({
+                                'Parameter': f'{val_col_prefix}_Missing_Pct',
+                                'Value': f"{(var_missing/var_total)*100:.1f}%" if var_total else "0%"
+                            })
+
+                    # Count fill values applied (using first variable as proxy)
+                    if value_cols:
+                        nofill_missing = (df_nofill_out[value_cols] == MISSING_VALUE).sum().sum()
+                        fill_missing = (df_fill_out[value_cols] == MISSING_VALUE).sum().sum()
+                        filled_count = nofill_missing - fill_missing
+                        stats_rows.append({'Parameter': 'Fill_Applied_Count', 'Value': filled_count})
+
+                    stats_rows = pd.DataFrame(stats_rows)
                     meta_final = pd.concat([meta_df, stats_rows], ignore_index=True)
                     meta_final.to_excel(writer, sheet_name='Metadata', index=False)
             
@@ -394,12 +408,18 @@ class DataExporter:
                 'Site': site,
             }
             
-            # Extract NO2 and HCHO for each cell
+            # Get available data variables (exclude coordinates and metadata)
+            data_vars = [v for v in dataset.data_vars if v not in ['LAT', 'LON', 'TFLAG']]
+
+            # Extract data for each cell
             for i, (r, c, dist) in enumerate(cells):
-                if 'NO2_TropVCD' in dataset:
-                    raw_data[f'Cell{i}_NO2'] = dataset['NO2_TropVCD'].isel(ROW=r, COL=c).values.flatten()
-                if 'HCHO_TotVCD' in dataset:
-                    raw_data[f'Cell{i}_HCHO'] = dataset['HCHO_TotVCD'].isel(ROW=r, COL=c).values.flatten()
+                for var_name in data_vars:
+                    try:
+                        # Create friendly column name
+                        col_name = var_name.split('_')[0] if '_' in var_name else var_name
+                        raw_data[f'Cell{i}_{col_name}'] = dataset[var_name].isel(ROW=r, COL=c).values.flatten()
+                    except Exception as e:
+                        logger.warning(f"Failed to extract {var_name}: {e}")
             
             df_site = pd.DataFrame(raw_data)
             
@@ -409,10 +429,8 @@ class DataExporter:
             if df_filtered.empty:
                 continue
             
-            # Create filled version
-            no2_cols = [f'Cell{i}_NO2' for i in range(n_cells) if f'Cell{i}_NO2' in df_filtered.columns]
-            hcho_cols = [f'Cell{i}_HCHO' for i in range(n_cells) if f'Cell{i}_HCHO' in df_filtered.columns]
-            value_cols = no2_cols + hcho_cols
+            # Get all cell data columns
+            value_cols = [c for c in df_filtered.columns if c.startswith('Cell')]
             
             df_filled = apply_monthly_hourly_fill(df_filtered, value_cols)
             
@@ -421,57 +439,47 @@ class DataExporter:
                 row = {'Date': date, 'Site': site}
                 grp_filled = df_filled[df_filled['Date'] == date]
                 
-                # Column naming based on mode
-                if use_radius_naming:
-                    no2_nofill_col = f'TEMPO_NoFill_NO2_{radius_str}'
-                    no2_nofill_cnt_col = 'TEMPO_NoFill_NO2_Cnt'
-                    hcho_nofill_col = f'TEMPO_NoFill_HCHO_{radius_str}'
-                    hcho_nofill_cnt_col = 'TEMPO_NoFill_HCHO_Cnt'
-                    no2_fill_col = f'TEMPO_Fill_NO2_{radius_str}'
-                    no2_fill_cnt_col = 'TEMPO_Fill_NO2_Cnt'
-                    hcho_fill_col = f'TEMPO_Fill_HCHO_{radius_str}'
-                    hcho_fill_cnt_col = 'TEMPO_Fill_HCHO_Cnt'
-                else:
-                    label = str(n_cells)
-                    no2_nofill_col = f'NO2_NoFill_{label}_Avg'
-                    no2_nofill_cnt_col = f'NO2_NoFill_{label}_Cnt'
-                    hcho_nofill_col = f'HCHO_NoFill_{label}_Avg'
-                    hcho_nofill_cnt_col = f'HCHO_NoFill_{label}_Cnt'
-                    no2_fill_col = f'NO2_Fill_{label}_Avg'
-                    no2_fill_cnt_col = f'NO2_Fill_{label}_Cnt'
-                    hcho_fill_col = f'HCHO_Fill_{label}_Avg'
-                    hcho_fill_cnt_col = f'HCHO_Fill_{label}_Cnt'
-                
-                # NoFill
-                if no2_cols:
-                    no2_vals = grp[no2_cols].values.flatten()
-                    no2_valid = no2_vals[~np.isnan(no2_vals)]
-                    # Also filter out fill values
-                    no2_valid = no2_valid[(no2_valid > -900) & (no2_valid < 1e20)]
-                    row[no2_nofill_col] = np.mean(no2_valid) if len(no2_valid) > 0 else MISSING_VALUE
-                    row[no2_nofill_cnt_col] = len(no2_valid)
-                
-                if hcho_cols:
-                    hcho_vals = grp[hcho_cols].values.flatten()
-                    hcho_valid = hcho_vals[~np.isnan(hcho_vals)]
-                    hcho_valid = hcho_valid[(hcho_valid > -900) & (hcho_valid < 1e20)]
-                    row[hcho_nofill_col] = np.mean(hcho_valid) if len(hcho_valid) > 0 else MISSING_VALUE
-                    row[hcho_nofill_cnt_col] = len(hcho_valid)
-                
-                # Fill
-                if no2_cols:
-                    no2_vals_f = grp_filled[no2_cols].values.flatten()
-                    no2_valid_f = no2_vals_f[~np.isnan(no2_vals_f)]
-                    no2_valid_f = no2_valid_f[(no2_valid_f > -900) & (no2_valid_f < 1e20)]
-                    row[no2_fill_col] = np.mean(no2_valid_f) if len(no2_valid_f) > 0 else MISSING_VALUE
-                    row[no2_fill_cnt_col] = len(no2_valid_f)
-                
-                if hcho_cols:
-                    hcho_vals_f = grp_filled[hcho_cols].values.flatten()
-                    hcho_valid_f = hcho_vals_f[~np.isnan(hcho_vals_f)]
-                    hcho_valid_f = hcho_valid_f[(hcho_valid_f > -900) & (hcho_valid_f < 1e20)]
-                    row[hcho_fill_col] = np.mean(hcho_valid_f) if len(hcho_valid_f) > 0 else MISSING_VALUE
-                    row[hcho_fill_cnt_col] = len(hcho_valid_f)
+                # Dynamically process each variable type
+                # Get unique variable names from cell columns
+                var_types = set()
+                for col in value_cols:
+                    # Extract variable name from Cell{i}_{VAR} format
+                    if 'Cell' in col and '_' in col:
+                        var_type = col.split('_', 1)[1]  # Get part after first underscore
+                        var_types.add(var_type)
+
+                for var_type in var_types:
+                    var_cols = [c for c in value_cols if c.endswith(f'_{var_type}')]
+
+                    if not var_cols:
+                        continue
+
+                    # Column naming based on mode
+                    if use_radius_naming:
+                        nofill_col = f'TEMPO_NoFill_{var_type}_{radius_str}'
+                        nofill_cnt_col = f'TEMPO_NoFill_{var_type}_Cnt'
+                        fill_col = f'TEMPO_Fill_{var_type}_{radius_str}'
+                        fill_cnt_col = f'TEMPO_Fill_{var_type}_Cnt'
+                    else:
+                        label = str(n_cells)
+                        nofill_col = f'{var_type}_NoFill_{label}_Avg'
+                        nofill_cnt_col = f'{var_type}_NoFill_{label}_Cnt'
+                        fill_col = f'{var_type}_Fill_{label}_Avg'
+                        fill_cnt_col = f'{var_type}_Fill_{label}_Cnt'
+
+                    # NoFill
+                    vals = grp[var_cols].values.flatten()
+                    valid = vals[~np.isnan(vals)]
+                    valid = valid[(valid > -900) & (valid < 1e20)]
+                    row[nofill_col] = np.mean(valid) if len(valid) > 0 else MISSING_VALUE
+                    row[nofill_cnt_col] = len(valid)
+
+                    # Fill
+                    vals_f = grp_filled[var_cols].values.flatten()
+                    valid_f = vals_f[~np.isnan(vals_f)]
+                    valid_f = valid_f[(valid_f > -900) & (valid_f < 1e20)]
+                    row[fill_col] = np.mean(valid_f) if len(valid_f) > 0 else MISSING_VALUE
+                    row[fill_cnt_col] = len(valid_f)
                 
                 all_rows.append(row)
         
@@ -590,49 +598,56 @@ class DataExporter:
                     'Dist (km)': dist
                 })
 
-            # Calculate spatial means
-            no2_means = []
-            hcho_means = []
-            
+            # Get available data variables (exclude coordinates and metadata)
+            data_vars = [v for v in dataset.data_vars if v not in ['LAT', 'LON', 'TFLAG']]
+
+            # Calculate spatial means for each variable
+            var_means = {var: [] for var in data_vars}
+
             # Extract data for all timesteps
             for t_idx in range(len(utc_times)):
-                # Get values for all cells at this timestep
-                no2_vals = []
-                hcho_vals = []
-                
-                for r, c, _ in cells:
-                    if 'NO2_TropVCD' in dataset:
-                        # Handle TIME, TSTEP, or HOUR dimension
-                        val = dataset['NO2_TropVCD'].isel(**{time_dim: t_idx}, ROW=r, COL=c).item()
-                        no2_vals.append(val)
-                    
-                    if 'HCHO_TotVCD' in dataset:
-                        val = dataset['HCHO_TotVCD'].isel(**{time_dim: t_idx}, ROW=r, COL=c).item()
-                        hcho_vals.append(val)
-                
-                # Average (ignoring NaNs)
-                # Suppress RuntimeWarning for mean of empty slice
-                with np.errstate(all='ignore'):
-                    no2_mean = np.nanmean(no2_vals) if no2_vals else np.nan
-                    hcho_mean = np.nanmean(hcho_vals) if hcho_vals else np.nan
-                
-                no2_means.append(no2_mean)
-                hcho_means.append(hcho_mean)
-            
-            # Add to DataFrame
-            df_raw[f'{site}_NO2'] = no2_means
-            df_raw[f'{site}_HCHO'] = hcho_means
-            
-            # Calculate FNR
-            # Avoid division by zero/small numbers
-            no2_arr = np.array(no2_means)
-            hcho_arr = np.array(hcho_means)
-            fnr = np.where(no2_arr > 1e-12, hcho_arr / no2_arr, np.nan)
-            df_raw[f'{site}_FNR'] = fnr
+                for var_name in data_vars:
+                    try:
+                        # Get values for all cells at this timestep
+                        vals = []
+                        for r, c, _ in cells:
+                            val = dataset[var_name].isel(**{time_dim: t_idx}, ROW=r, COL=c).item()
+                            vals.append(val)
+
+                        # Average (ignoring NaNs)
+                        with np.errstate(all='ignore'):
+                            mean_val = np.nanmean(vals) if vals else np.nan
+                        var_means[var_name].append(mean_val)
+                    except Exception as e:
+                        logger.warning(f"Failed to extract {var_name}: {e}")
+                        var_means[var_name].append(np.nan)
+
+            # Add to DataFrame with friendly names
+            for var_name in data_vars:
+                # Create friendly column name
+                col_name = var_name.split('_')[0] if '_' in var_name else var_name
+                df_raw[f'{site}_{col_name}'] = var_means[var_name]
+
+            # Calculate FNR if both NO2 and HCHO are present
+            no2_col = None
+            hcho_col = None
+            for var_name in data_vars:
+                if 'NO2' in var_name:
+                    no2_col = var_name
+                if 'HCHO' in var_name:
+                    hcho_col = var_name
+
+            if no2_col and hcho_col:
+                no2_arr = np.array(var_means[no2_col])
+                hcho_arr = np.array(var_means[hcho_col])
+                fnr = np.where(no2_arr > 1e-12, hcho_arr / no2_arr, np.nan)
+                df_raw[f'{site}_FNR'] = fnr
 
         # Create Filled_Data (gap filling)
         df_filled = df_raw.copy()
-        value_cols = [c for c in df_filled.columns if '_NO2' in c or '_HCHO' in c or '_FNR' in c]
+        # Get all site data columns (exclude time columns)
+        exclude_cols = ['UTC', 'Local', 'Date', 'Hour']
+        value_cols = [c for c in df_filled.columns if c not in exclude_cols]
         
         # Helper to fill by hour
         for col in value_cols:

@@ -63,14 +63,18 @@ class DataProcessor:
             # Sort by timestamp
             combined = combined.sortby('TIME')
             
-            # Calculate FNR (HCHO / NO2)
-            # Filter low NO2 to avoid division by zero or noise
-            # Also filter out fill values (typically -9.999e36)
-            combined['FNR'] = xr.where(
-                (combined['NO2_TropVCD'] > 1e-12) & (combined['HCHO_TotVCD'] > -1e30),
-                combined['HCHO_TotVCD'] / combined['NO2_TropVCD'],
-                np.nan
-            )
+            # Calculate FNR (HCHO / NO2) only if both variables exist
+            if 'NO2_TropVCD' in combined and 'HCHO_TotVCD' in combined:
+                logger.info("Calculating FNR (HCHO/NO2 ratio)")
+                # Filter low NO2 to avoid division by zero or noise
+                # Also filter out fill values (typically -9.999e36)
+                combined['FNR'] = xr.where(
+                    (combined['NO2_TropVCD'] > 1e-12) & (combined['HCHO_TotVCD'] > -1e30),
+                    combined['HCHO_TotVCD'] / combined['NO2_TropVCD'],
+                    np.nan
+                )
+            else:
+                logger.info("Skipping FNR calculation - NO2 or HCHO not selected")
             
             # Load data into memory so we can close source files
             combined.load()

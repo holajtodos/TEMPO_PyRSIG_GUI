@@ -210,7 +210,12 @@ class CreatePage(ft.Container):
         self._extend_mode = False  # True = extending existing dataset
         self._extend_dataset_id: Optional[str] = None  # ID of dataset being extended
 
-        
+        # Variable selection state
+        self._available_variables = []  # Populated in _build
+        self._selected_var_ids = set()  # Set of product IDs
+        self._var_checkboxes = {}  # {product_id: ft.Checkbox}
+        self._var_search_field = None  # Search text field
+
         # Build the page
         self._build()
 
@@ -269,8 +274,8 @@ class CreatePage(ft.Container):
         
         self._load_btn = ft.FilledTonalButton(
             content=ft.Row([
-                ft.Icon(ft.Icons.DOWNLOAD, size=18),
-                ft.Text("Load"),
+                ft.Icon(ft.Icons.DOWNLOAD, size=18, color=Colors.ON_SURFACE),
+                ft.Text("Load", color=Colors.ON_SURFACE),
             ], spacing=6, tight=True),
             on_click=self._on_load_dataset_click,
         )
@@ -401,11 +406,11 @@ class CreatePage(ft.Container):
         self._end_date = today
         
         # Date picker buttons (click to open calendar)
-        self._date_start_label = ft.Text(default_start.strftime("%b %d, %Y"))
+        self._date_start_label = ft.Text(default_start.strftime("%b %d, %Y"), color=Colors.ON_SURFACE)
         self._date_start_btn = ft.OutlinedButton(
             content=ft.Row(
                 [
-                    ft.Icon(ft.Icons.CALENDAR_MONTH),
+                    ft.Icon(ft.Icons.CALENDAR_MONTH, color=Colors.ON_SURFACE),
                     self._date_start_label,
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
@@ -416,12 +421,12 @@ class CreatePage(ft.Container):
                 shape=ft.RoundedRectangleBorder(radius=8),
             ),
         )
-        
-        self._date_end_label = ft.Text(today.strftime("%b %d, %Y"))
+
+        self._date_end_label = ft.Text(today.strftime("%b %d, %Y"), color=Colors.ON_SURFACE)
         self._date_end_btn = ft.OutlinedButton(
              content=ft.Row(
                 [
-                    ft.Icon(ft.Icons.CALENDAR_MONTH),
+                    ft.Icon(ft.Icons.CALENDAR_MONTH, color=Colors.ON_SURFACE),
                     self._date_end_label,
                 ],
                 alignment=ft.MainAxisAlignment.CENTER,
@@ -451,9 +456,18 @@ class CreatePage(ft.Container):
         
         # Quick preset buttons for day selection
         day_presets = ft.Row([
-            ft.TextButton("Weekdays", on_click=lambda e: self._day_selector.select_weekdays()),
-            ft.TextButton("Weekends", on_click=lambda e: self._day_selector.select_weekends()),
-            ft.TextButton("All", on_click=lambda e: self._day_selector.select_all()),
+            ft.TextButton(
+                content=ft.Text("Weekdays", color=Colors.ON_SURFACE),
+                on_click=lambda e: self._day_selector.select_weekdays()
+            ),
+            ft.TextButton(
+                content=ft.Text("Weekends", color=Colors.ON_SURFACE),
+                on_click=lambda e: self._day_selector.select_weekends()
+            ),
+            ft.TextButton(
+                content=ft.Text("All", color=Colors.ON_SURFACE),
+                on_click=lambda e: self._day_selector.select_all()
+            ),
         ], spacing=4)
         
         self._hour_start = ft.Dropdown(
@@ -616,25 +630,166 @@ class CreatePage(ft.Container):
                 ], spacing=4),
             ], spacing=8),
         )
-        
+
+        # =====================================================================
+        # Variable Selection Section (NEW - DYNAMIC TEMPO VARIABLES)
+        # =====================================================================
+        from ...core.variable_registry import VariableRegistry
+
+        # Discover available variables
+        self._available_variables = VariableRegistry.discover_variables()
+
+        # Default to legacy 3 variables
+        self._selected_var_ids = set(VariableRegistry.get_default_variables())
+
+        # Search box
+        self._var_search_field = ft.TextField(
+            label="Search variables",
+            prefix_icon=ft.Icons.SEARCH,
+            border_color=Colors.BORDER,
+            focused_border_color=Colors.PRIMARY,
+            bgcolor=Colors.SURFACE_VARIANT,
+            text_style=ft.TextStyle(color=Colors.ON_SURFACE, size=13),
+            hint_style=ft.TextStyle(color=Colors.ON_SURFACE_VARIANT),
+            on_change=self._on_var_search_change,
+            dense=True,
+        )
+
+        # Preset buttons
+        preset_buttons = ft.Row([
+            ft.TextButton(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.CHECK_CIRCLE_OUTLINE, size=16, color=Colors.ON_SURFACE),
+                    ft.Text("Default (NO₂, HCHO, O₃)", size=12, color=Colors.ON_SURFACE),
+                ], spacing=4, tight=True),
+                on_click=lambda _: self._on_var_preset_click("default"),
+                style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=4)),
+            ),
+            ft.TextButton(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.SCIENCE, size=16, color=Colors.ON_SURFACE),
+                    ft.Text("All Trace Gases", size=12, color=Colors.ON_SURFACE),
+                ], spacing=4, tight=True),
+                on_click=lambda _: self._on_var_preset_click("trace_gases"),
+                style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=4)),
+            ),
+            ft.TextButton(
+                content=ft.Row([
+                    ft.Icon(ft.Icons.CLEAR_ALL, size=16, color=Colors.ON_SURFACE),
+                    ft.Text("Clear All", size=12, color=Colors.ON_SURFACE),
+                ], spacing=4, tight=True),
+                on_click=lambda _: self._on_var_preset_click("clear"),
+                style=ft.ButtonStyle(padding=ft.padding.symmetric(horizontal=8, vertical=4)),
+            ),
+        ], spacing=8, wrap=True)
+
+        # Group variables by category
+        grouped_vars = VariableRegistry.group_by_category(self._available_variables)
+
+        # Create checkboxes grouped by category
+        var_checkbox_groups = []
+        for category, variables in grouped_vars.items():
+            # Category header
+            category_header = ft.Text(
+                category,
+                size=13,
+                weight=ft.FontWeight.W_600,
+                color=Colors.PRIMARY,
+            )
+
+            # Variable checkboxes
+            var_checkboxes = []
+            for var in variables:
+                is_selected = var.product_id in self._selected_var_ids
+
+                checkbox = ft.Checkbox(
+                    label=var.display_name,
+                    value=is_selected,
+                    on_change=lambda e, pid=var.product_id: self._on_var_toggle(pid, e.control.value),
+                    label_style=ft.TextStyle(color=Colors.ON_SURFACE),
+                )
+
+                # Store checkbox reference
+                self._var_checkboxes[var.product_id] = checkbox
+
+                # Create row with checkbox and tooltip
+                var_row = ft.Row([
+                    checkbox,
+                    HelpTooltip(f"{var.description}\nUnit: {var.unit}" if var.unit else var.description),
+                ], spacing=4, tight=True)
+
+                var_checkboxes.append(var_row)
+
+            var_checkbox_groups.append(ft.Column([
+                category_header,
+                *var_checkboxes,
+                ft.Container(height=8),
+            ], spacing=4))
+
+        # Scrollable variable list
+        var_list_scrollable = ft.Container(
+            content=ft.Column(var_checkbox_groups, spacing=0, scroll=ft.ScrollMode.AUTO),
+            height=300,
+            border=ft.Border(
+                left=ft.BorderSide(1, Colors.BORDER),
+                top=ft.BorderSide(1, Colors.BORDER),
+                right=ft.BorderSide(1, Colors.BORDER),
+                bottom=ft.BorderSide(1, Colors.BORDER),
+            ),
+            border_radius=8,
+            padding=12,
+            bgcolor=Colors.SURFACE,
+        )
+
+        # Validation error message
+        self._var_validation_error = ft.Text(
+            "⚠️ At least 1 variable must be selected",
+            color=Colors.ERROR,
+            size=12,
+            visible=False,
+        )
+
+        variable_section = SectionCard(
+            title="Variables to Download",
+            icon=ft.Icons.SCIENCE,
+            help_text=(
+                "Select which TEMPO data variables to download.\n\n"
+                "TEMPO provides measurements of trace gases, aerosols, and clouds. "
+                "The default selection (NO₂, HCHO, O₃) is recommended for air quality analysis.\n\n"
+                "Tips:\n"
+                "• More variables = longer download times\n"
+                "• Variables can be filtered per analysis after download\n"
+                "• Some derived metrics (like FNR) require specific variables"
+            ),
+            content=ft.Column([
+                self._var_search_field,
+                ft.Container(height=4),
+                preset_buttons,
+                ft.Container(height=8),
+                var_list_scrollable,
+                ft.Container(height=4),
+                self._var_validation_error,
+            ], spacing=0),
+        )
+
         # =====================================================================
         # Download Button and Progress
         # =====================================================================
         self._download_btn = ft.FilledButton(
             content=ft.Row([
-                ft.Icon(ft.Icons.CLOUD_DOWNLOAD, size=20),
-                ft.Text("Download & Create Dataset"),
+                ft.Icon(ft.Icons.CLOUD_DOWNLOAD, size=20, color=Colors.ON_PRIMARY),
+                ft.Text("Download & Create Dataset", color=Colors.ON_PRIMARY),
             ], spacing=8, tight=True),
             style=ft.ButtonStyle(
                 padding=ft.padding.symmetric(horizontal=24, vertical=12),
             ),
             on_click=self._on_download_click,
         )
-        
+
         self._cancel_btn = ft.OutlinedButton(
             content=ft.Row([
-                ft.Icon(ft.Icons.CANCEL, size=20),
-                ft.Text("Cancel"),
+                ft.Icon(ft.Icons.CANCEL, size=20, color=Colors.ON_SURFACE),
+                ft.Text("Cancel", color=Colors.ON_SURFACE),
             ], spacing=8, tight=True),
             visible=False,
             on_click=self._on_cancel_click,
@@ -720,11 +875,13 @@ class CreatePage(ft.Container):
                     ft.Container(expand=True),
                     ft.IconButton(
                         icon=ft.Icons.SAVE_ALT,
+                        icon_color=Colors.ON_SURFACE,
                         tooltip="Save Image",
                         on_click=self._on_save_map_click,
                     ),
                     ft.IconButton(
                         icon=ft.Icons.REFRESH,
+                        icon_color=Colors.ON_SURFACE,
                         tooltip="Refresh map preview",
                         on_click=self._on_refresh_map_click,
                     ),
@@ -756,8 +913,8 @@ class CreatePage(ft.Container):
         # Back button for header
         back_btn = ft.TextButton(
             content=ft.Row([
-                ft.Icon(ft.Icons.ARROW_BACK, size=18),
-                ft.Text("Back to Library"),
+                ft.Icon(ft.Icons.ARROW_BACK, size=18, color=Colors.ON_SURFACE),
+                ft.Text("Back to Library", color=Colors.ON_SURFACE),
             ], spacing=6, tight=True),
             on_click=self._on_back_click,
         )
@@ -791,10 +948,10 @@ class CreatePage(ft.Container):
                 temporal_section,
                 ft.Container(height=8),
                 filter_section,
+                ft.Container(height=8),
+                variable_section,
                 ft.Container(height=16),
-                
 
-                
                 # Download controls
                 ft.Row([
                     self._download_btn,
@@ -1389,7 +1546,16 @@ class CreatePage(ft.Container):
             if not self._extend_dataset_id:
                 self._status_log.add_error("Please load a dataset first!")
                 return
-        
+
+        # Validate variable selection
+        if not self._validate_variable_selection():
+            self._status_log.add_error("⚠️ At least 1 variable must be selected!")
+            self._var_validation_error.visible = True
+            self.update()
+            return
+        else:
+            self._var_validation_error.visible = False
+
         # Start download
         self._is_downloading = True
         self._download_btn.disabled = True
@@ -1476,6 +1642,7 @@ class CreatePage(ft.Container):
                     hour_filter=hour_filter,
                     max_cloud=max_cloud,
                     max_sza=max_sza,
+                    selected_variables=list(self._selected_var_ids),  # NEW
                     status=DatasetStatus.DOWNLOADING,
                 )
                 
@@ -1515,7 +1682,8 @@ class CreatePage(ft.Container):
             
             # Download all granules
             self._status_log.add_info(f"📡 Downloading {len(granules)} granules...")
-            
+            self._status_log.add_info(f"🔬 Selected variables: {', '.join(dataset.selected_variables)}")
+
             # Show worker progress panel
             # Update workers count based on current config
             num_workers = self.config.download_workers if self.config else 4
@@ -1558,6 +1726,7 @@ class CreatePage(ft.Container):
                 dataset_name=safe_name,
                 max_cloud=max_cloud,
                 max_sza=max_sza,
+                selected_variables=dataset.selected_variables,  # NEW - Pass selected variables
                 status=adapter
             )
             
@@ -1662,10 +1831,64 @@ class CreatePage(ft.Container):
         """Cancel the download."""
         self._is_downloading = False
         self._status_log.add_warning("Cancelling download...")
-        
+
         # Cancel in download manager
         download_manager = self._get_download_manager()
         if download_manager and self._current_download_id:
             download_manager.cancel(self._current_download_id)
-        
+
         self.update()
+
+    # =========================================================================
+    # Variable Selection Handlers
+    # =========================================================================
+
+    def _on_var_search_change(self, e):
+        """Filter variables by search text."""
+        search_text = e.control.value.lower()
+
+        for product_id, checkbox in self._var_checkboxes.items():
+            # Search in both product_id and display name
+            var_meta = next((v for v in self._available_variables if v.product_id == product_id), None)
+            if var_meta:
+                visible = (
+                    search_text in product_id.lower()
+                    or search_text in var_meta.display_name.lower()
+                    or search_text in var_meta.description.lower()
+                )
+                checkbox.visible = visible
+
+        self.update()
+
+    def _on_var_toggle(self, product_id: str, selected: bool):
+        """Update selection set when checkbox is toggled."""
+        if selected:
+            self._selected_var_ids.add(product_id)
+        else:
+            self._selected_var_ids.discard(product_id)
+
+    def _on_var_preset_click(self, preset: str):
+        """Apply variable preset."""
+        from ...core.variable_registry import VariableRegistry
+
+        if preset == "default":
+            # Default 3 variables
+            selected = set(VariableRegistry.get_default_variables())
+        elif preset == "trace_gases":
+            # All trace gas variables
+            selected = {v.product_id for v in self._available_variables if v.category == "Trace Gases"}
+        elif preset == "clear":
+            selected = set()
+        else:
+            return
+
+        # Update checkboxes
+        for product_id, checkbox in self._var_checkboxes.items():
+            checkbox.value = product_id in selected
+
+        self._selected_var_ids = selected
+        self.update()
+
+    def _validate_variable_selection(self) -> bool:
+        """Validate that at least one variable is selected."""
+        return len(self._selected_var_ids) > 0

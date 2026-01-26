@@ -32,11 +32,11 @@ class MapPlotter:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.geometry_cache = {}
         self._temp_file_counter = 0
-        
-    def generate_map(self, 
-                    dataset: xr.Dataset, 
-                    hour: int, 
-                    variable: str, 
+
+    def generate_map(self,
+                    dataset: xr.Dataset,
+                    hour: int,
+                    variable: str,
                     dataset_name: str,
                     bbox: list[float] = None,
                     road_detail: str = 'primary',
@@ -47,14 +47,14 @@ class MapPlotter:
                     border_width: float = 1.5,
                     road_scale: float = 1.0,
                     vmin: float = None,
-                    vmax: float = None) -> str:
+                    vmax: float = None) -> tuple[Optional[str], list[str]]:
         """
         Generate a map plot for a specific hour and variable.
-        
+
         Args:
-            dataset: xarray Dataset with 'NO2_TropVCD', 'HCHO_TotVCD', or 'FNR'
+            dataset: xarray Dataset with 'NO2_TropVCD', 'HCHO_TotVCD', 'O3_TotVCD', or 'FNR'
             hour: UTC hour
-            variable: 'NO2', 'HCHO', or 'FNR'
+            variable: 'NO2', 'HCHO', 'O3', or 'FNR'
             dataset_name: Name of dataset (for display)
             bbox: [west, south, east, north]
             road_detail: 'primary', 'major', or 'all'
@@ -67,18 +67,21 @@ class MapPlotter:
             road_scale: Scale factor for road widths (default 1.0)
             vmin: Minimum value for color scale
             vmax: Maximum value for color scale
-            
+
         Returns:
-            Path to the temporary PNG file (always regenerated fresh)
+            Tuple of (path to PNG file or None, list of warning/error messages)
         """
+        messages = []  # Collect warnings and errors
         import tempfile
         import time
 
         try:
             logger.info(f"Generating map for {variable} @ H{hour}")
             if 'cartopy.crs' not in sys.modules:
-                logger.warning("Cartopy not loaded, using fallback.")
-                return self._generate_dummy_map(variable, hour)
+                msg = "⚠️ Cartopy not loaded, using fallback."
+                logger.warning(msg)
+                messages.append(msg)
+                return self._generate_dummy_map(variable, hour), messages
 
             # Extract date range and available hours info for title
             import pandas as pd
@@ -93,8 +96,10 @@ class MapPlotter:
                 
                 # New format: TIME is datetime, need to extract by hour and average
                 if hour not in dataset.TIME.dt.hour.values:
-                    print(f"DEBUG: Hour {hour} not found in dataset TIME: {dataset.TIME.dt.hour.values}")
-                    return None
+                    msg = f"❌ Hour {hour} not found in dataset TIME"
+                    logger.error(msg)
+                    messages.append(msg)
+                    return None, messages
                 ds_hour = dataset.sel(TIME=dataset.TIME.dt.hour == hour).mean(dim='TIME')
             elif 'TSTEP' in dataset.dims:
                 timestamps = pd.to_datetime(dataset.TSTEP.values)
@@ -103,67 +108,107 @@ class MapPlotter:
                 
                 # Old format: TSTEP is datetime, need to extract by hour
                 if hour not in dataset.TSTEP.dt.hour.values:
-                    print(f"DEBUG: Hour {hour} not found in dataset TSTEP: {dataset.TSTEP.dt.hour.values}")
-                    return None
+                    msg = f"❌ Hour {hour} not found in dataset TSTEP"
+                    logger.error(msg)
+                    messages.append(msg)
+                    return None, messages
                 ds_hour = dataset.sel(TSTEP=dataset.TSTEP.dt.hour == hour).mean(dim='TSTEP')
             elif 'HOUR' in dataset.dims:
                 available_hours = sorted(dataset.HOUR.values.tolist())
                 
                 # Aggregated format: dimension is integer hours
                 if hour not in dataset.HOUR.values:
-                    print(f"DEBUG: Hour {hour} not found in dataset HOURs: {dataset.HOUR.values}")
-                    return None
+                    msg = f"❌ Hour {hour} not found in dataset HOURs"
+                    logger.error(msg)
+                    messages.append(msg)
+                    return None, messages
                 ds_hour = dataset.sel(HOUR=hour)
             elif 'hour' in dataset.dims:
                 available_hours = sorted(dataset.hour.values.tolist())
                 
                 # Legacy format: dimension is integer hours
                 if hour not in dataset.hour.values:
-                    print(f"DEBUG: Hour {hour} not found in dataset hours: {dataset.hour.values}")
-                    return None
+                    msg = f"❌ Hour {hour} not found in dataset hours"
+                    logger.error(msg)
+                    messages.append(msg)
+                    return None, messages
                 ds_hour = dataset.sel(hour=hour)
             else:
-                logger.error(f"Dataset has no recognized time dimension. Dims: {list(dataset.dims)}")
-                return None
+                msg = f"❌ Dataset has no recognized time dimension. Dims: {list(dataset.dims)}"
+                logger.error(msg)
+                messages.append(msg)
+                return None, messages
             logger.debug(f"Extracted hour {hour} slice.")
             
-            if variable == 'FNR':
-                data = ds_hour['FNR']
-                if colormap:
-                    cmap = colormap
+            # Dynamic variable handling - check if variable exists in dataset
+            if variable not in ds_hour:
+                msg = f"❌ Variable '{variable}' not found in dataset. Available: {list(ds_hour.data_vars.keys())}"
+                logger.error(msg)
+                messages.append(msg)
+                return None, messages
+
+            # Extract data
+            data = ds_hour[variable]
+
+            # Mask fill values (typically -9.999e36)
+            data = data.where(data > -1e30)
+
+            # Get variable metadata from registry for better labels and colormaps
+            try:
+                from .variable_registry import VariableRegistry
+                var_meta = None
+
+                # Find matching variable in registry by output_var name
+                for v in VariableRegistry.discover_variables():
+                    if v.output_var == variable:
+                        var_meta = v
+                        break
+
+                if var_meta:
+                    # Use metadata from registry
+                    label = f"{var_meta.display_name}"
+                    if var_meta.unit:
+                        label += f" ({var_meta.unit})"
+                    default_cmap = var_meta.colormap
                 else:
-                    # Blue-Grey-Red colormap
+                    # Fallback for variables not in registry (like FNR)
+                    label = variable
+                    default_cmap = 'viridis'
+
+            except Exception as e:
+                logger.warning(f"Could not get metadata from registry: {e}")
+                label = variable
+                default_cmap = 'viridis'
+
+            # Apply colormap override if specified, otherwise use default
+            if colormap:
+                cmap = colormap
+            else:
+                # Special handling for common variables
+                if variable == 'FNR':
+                    # Blue-Grey-Red colormap for FNR
                     colors = [(0.3, 0.5, 1), 'silver', (1, 0.4, 0.4)]
                     cmap = LinearSegmentedColormap.from_list('bgr', colors, N=256)
-                
-                # Default FNR range is 2-8, or custom
-                norm_vmin = vmin if vmin is not None else 2
-                norm_vmax = vmax if vmax is not None else 8
-                norm = Normalize(vmin=norm_vmin, vmax=norm_vmax)
-                
-                label = 'FNR (HCHO/NO2)'
-                data = data.where(data > 0)
-            elif variable == 'NO2':
-                data = ds_hour['NO2_TropVCD']
-                # Mask fill values (typically -9.999e36)
-                data = data.where(data > -1e30)
-                cmap = colormap if colormap else 'viridis'
-                norm = Normalize(vmin=vmin, vmax=vmax) if (vmin is not None or vmax is not None) else None
-                label = 'NO2 Trop VCD (molecules/cm²)'
-            elif variable == 'HCHO':
-                data = ds_hour['HCHO_TotVCD']
-                # Mask fill values (typically -9.999e36)
-                data = data.where(data > -1e30)
-                cmap = colormap if colormap else 'magma'
-                norm = Normalize(vmin=vmin, vmax=vmax) if (vmin is not None or vmax is not None) else None
-                label = 'HCHO Total VCD (molecules/cm²)'
-            else:
-                return None
+                    label = 'FNR (HCHO/NO2)'
+                    # Filter positive values only
+                    data = data.where(data > 0)
+                    # Default FNR range
+                    if vmin is None:
+                        vmin = 2
+                    if vmax is None:
+                        vmax = 8
+                else:
+                    cmap = default_cmap
+
+            # Setup normalization
+            norm = Normalize(vmin=vmin, vmax=vmax) if (vmin is not None or vmax is not None) else None
                 
             data = data.squeeze(drop=True)
             if data.isnull().all():
-                logger.warning(f"Data for {variable} is all NaN (empty) for hour {hour}.")
-                return None
+                msg = f"⚠️ Data for {variable} is all NaN (empty) for hour {hour}."
+                logger.warning(msg)
+                messages.append(msg)
+                return None, messages
 
             # Setup plot
             fig = plt.figure(figsize=(9, 8))
@@ -175,8 +220,10 @@ class MapPlotter:
                 lons = ds_hour['LON'].values
             else:
                 # Fallback if no lat/lon arrays (projected)
-                # Simplified for now
-                return None
+                msg = "❌ No LAT/LON coordinates found in dataset"
+                logger.error(msg)
+                messages.append(msg)
+                return None, messages
 
             if bbox is None:
                 bbox = DEFAULT_BBOX
@@ -192,7 +239,9 @@ class MapPlotter:
             try:
                 self._add_road_overlay(ax, bbox, road_detail, road_scale)
             except Exception as road_err:
-                logger.warning(f"Road overlay failed (non-fatal): {road_err}")
+                msg = f"⚠️ Road overlay failed (non-fatal): {road_err}"
+                logger.warning(msg)
+                messages.append(msg)
             
             # Plot Data
             mesh = ax.pcolormesh(lons, lats, data, cmap=cmap, norm=norm, 
@@ -241,33 +290,34 @@ class MapPlotter:
             temp_path = self.cache_dir / temp_filename
             plt.savefig(temp_path, dpi=100, bbox_inches='tight')
             plt.close(fig)
-            
+
             logger.info(f"Map saved to {temp_path}")
-            return str(temp_path)
-            
+            return str(temp_path), messages
+
         except Exception as e:
-            logger.error(f"Plotting failed: {e}")
-            print(f"DEBUG: Plotting Exception: {e}")
+            msg = f"❌ Plotting failed: {e}"
+            logger.error(msg)
+            messages.append(msg)
             import traceback
             traceback.print_exc()
             plt.close('all')
-            return None
+            return None, messages
 
     def _generate_dummy_map(self, variable, hour):
         """Generate a placeholder image if Cartopy is missing."""
         import time
         fig, ax = plt.subplots(figsize=(5, 4))
-        ax.text(0.5, 0.5, f"{variable} Map\nHour {hour}\n(Cartopy Missing)", 
+        ax.text(0.5, 0.5, f"{variable} Map\nHour {hour}\n(Cartopy Missing)",
               ha='center', va='center')
         ax.axis('off')
-        
+
         self._temp_file_counter += 1
         temp_filename = f"dummy_{int(time.time() * 1000)}_{self._temp_file_counter}.png"
         temp_path = self.cache_dir / temp_filename
         plt.savefig(temp_path)
         plt.close(fig)
-        
-        return str(temp_path)
+
+        return str(temp_path), []
 
     def _add_road_overlay(self, ax, bbox: list[float], road_detail: str = 'primary', road_scale: float = 1.0):
         """

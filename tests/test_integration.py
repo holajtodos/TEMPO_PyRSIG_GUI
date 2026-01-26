@@ -249,14 +249,17 @@ class TestIntegrationPlot:
         config = INTEGRATION_TEST_CONFIG
         
         print("\nGenerating NO2 map for hour 18...")
-        result = plotter.generate_map(
+        result, messages = plotter.generate_map(
             dataset=processed_ds,
             hour=18,
             variable="NO2",
             dataset_name=integration_dataset.name,
             bbox=config["bbox"],
         )
-        
+
+        if messages:
+            print(f"Messages from plotter: {messages}")
+
         if result:
             print(f"Created map: {Path(result).name}")
             assert Path(result).exists()
@@ -347,13 +350,15 @@ class TestFullIntegrationPipeline:
         # Step 4: Plot
         print("\n[4/4] PLOTTING...")
         plotter = MapPlotter(workdir)
-        map_path = plotter.generate_map(
+        map_path, messages = plotter.generate_map(
             dataset=processed,
             hour=18,
             variable="NO2",
             dataset_name=dataset.name,
             bbox=config["bbox"],
         )
+        if messages:
+            print(f"Messages from plotter: {messages}")
         if map_path:
             print(f"Created map: {Path(map_path).name}")
         

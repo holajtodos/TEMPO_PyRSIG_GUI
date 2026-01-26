@@ -69,31 +69,40 @@ class Dataset:
     id: str                          # UUID
     name: str                        # User-friendly name
     created_at: datetime
-    
+
     # Geographic region
     bbox: BoundingBox
-    
+
     # Temporal filters
     date_start: date
     date_end: date
     day_filter: list[int]            # 0=Mon, 1=Tue, ..., 6=Sun
     hour_filter: list[int]           # UTC hours (0-23)
-    
+
     # Quality filters
     max_cloud: float                 # 0.0-1.0
     max_sza: float                   # Solar zenith angle in degrees
-    
+
+    # Variable selection (NEW - dynamic TEMPO variables)
+    selected_variables: Optional[list[str]] = None  # Product IDs (e.g., ["tempo.l2.no2.vertical_column_troposphere"])
+
     # Download status
     status: DatasetStatus = DatasetStatus.PENDING
     batch_job_id: Optional[str] = None # ID of batch job if part of one
     file_path: Optional[str] = None  # Path to combined .nc file
     file_hash: Optional[str] = None  # SHA256 of file content
     file_size_mb: float = 0.0
-    
+
     # Metadata
     last_accessed: Optional[datetime] = None
     granule_count: int = 0
     granules_downloaded: int = 0
+
+    def __post_init__(self):
+        """Backward compatibility: default to legacy 3 variables if not set."""
+        if self.selected_variables is None:
+            from ..core.variable_registry import VariableRegistry
+            self.selected_variables = VariableRegistry.get_default_variables()
     
     @property
     def progress(self) -> float:
@@ -126,6 +135,37 @@ class Dataset:
         hours = sorted(self.hour_filter)
         return f"{hours[0]:02d}:00-{hours[-1]:02d}:00 UTC"
 
+    def variables_str(self) -> str:
+        """Human-readable summary of selected variables for UI display."""
+        if not self.selected_variables:
+            return "None"
+
+        from ..core.variable_registry import VariableRegistry
+
+        # If it's the legacy 3 variables, show names
+        if self.selected_variables == VariableRegistry.get_default_variables():
+            return "NO₂, HCHO, O₃ (default)"
+
+        # If <= 3 variables, show short names
+        if len(self.selected_variables) <= 3:
+            try:
+                names = []
+                for product_id in self.selected_variables:
+                    var = VariableRegistry.get_variable_by_id(product_id)
+                    if var:
+                        # Extract short name (e.g., "NO₂" from "NO₂ Tropospheric VCD")
+                        short_name = var.display_name.split()[0]
+                        names.append(short_name)
+                    else:
+                        # Fallback: extract from product_id
+                        names.append(product_id.split('.')[-1].upper()[:4])
+                return ", ".join(names)
+            except Exception:
+                pass
+
+        # If > 3 variables, just show count
+        return f"{len(self.selected_variables)} variables"
+
 
 @dataclass
 class Granule:
@@ -155,8 +195,10 @@ class Granule:
     content_hash: str = ""           # SHA256 of request params
     no2_valid_pixels: int = 0
     hcho_valid_pixels: int = 0
+    o3_valid_pixels: int = 0
     no2_mean: Optional[float] = None
     hcho_mean: Optional[float] = None
+    o3_mean: Optional[float] = None
     
     # File reference
     file_path: Optional[str] = None

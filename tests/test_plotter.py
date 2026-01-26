@@ -59,15 +59,16 @@ class TestMapPlotter:
     
     def test_generate_map_no2(self, plotter, sample_hourly_dataset):
         """Test generating NO2 map."""
-        result = plotter.generate_map(
+        result, messages = plotter.generate_map(
             dataset=sample_hourly_dataset,
             hour=16,
             variable="NO2",
             dataset_name="TestDataset",
             bbox=[-112.8, 40.0, -111.5, 41.5],
         )
-        
-        # Should return a path (string)
+
+        # Should return a tuple of (path, messages)
+        assert isinstance(messages, list)
         # May be None if cartopy not available, or path if it worked
         if result is not None:
             assert Path(result).exists()
@@ -75,71 +76,76 @@ class TestMapPlotter:
     
     def test_generate_map_hcho(self, plotter, sample_hourly_dataset):
         """Test generating HCHO map."""
-        result = plotter.generate_map(
+        result, messages = plotter.generate_map(
             dataset=sample_hourly_dataset,
             hour=17,
             variable="HCHO",
             dataset_name="TestDataset",
             bbox=[-112.8, 40.0, -111.5, 41.5],
         )
-        
+
+        assert isinstance(messages, list)
         if result is not None:
             assert Path(result).exists()
     
     def test_generate_map_fnr(self, plotter, sample_hourly_dataset):
         """Test generating FNR map with custom colormap."""
-        result = plotter.generate_map(
+        result, messages = plotter.generate_map(
             dataset=sample_hourly_dataset,
             hour=18,
             variable="FNR",
             dataset_name="TestDataset",
             bbox=[-112.8, 40.0, -111.5, 41.5],
         )
-        
+
+        assert isinstance(messages, list)
         if result is not None:
             assert Path(result).exists()
     
     def test_map_cached(self, plotter, sample_hourly_dataset):
         """Test that cached maps are returned."""
         # Generate first time
-        result1 = plotter.generate_map(
+        result1, messages1 = plotter.generate_map(
             dataset=sample_hourly_dataset,
             hour=16,
             variable="NO2",
             dataset_name="CacheTest",
             bbox=[-112.8, 40.0, -111.5, 41.5],
         )
-        
+
         if result1 is None:
             pytest.skip("Map generation not available (cartopy missing)")
-        
+
         # Get modification time
         mtime1 = Path(result1).stat().st_mtime
-        
+
         # Generate second time - should return cached
-        result2 = plotter.generate_map(
+        result2, messages2 = plotter.generate_map(
             dataset=sample_hourly_dataset,
             hour=16,
             variable="NO2",
             dataset_name="CacheTest",
             bbox=[-112.8, 40.0, -111.5, 41.5],
         )
-        
+
         assert result1 == result2
         mtime2 = Path(result2).stat().st_mtime
         assert mtime1 == mtime2  # File wasn't regenerated
     
     def test_invalid_hour_returns_none(self, plotter, sample_hourly_dataset):
         """Test that requesting unavailable hour returns None."""
-        result = plotter.generate_map(
+        result, messages = plotter.generate_map(
             dataset=sample_hourly_dataset,
             hour=23,  # Not in sample data (only 16, 17, 18)
             variable="NO2",
             dataset_name="TestDataset",
             bbox=[-112.8, 40.0, -111.5, 41.5],
         )
-        
+
         assert result is None
+        assert isinstance(messages, list)
+        # Should have an error message about the hour not being found
+        assert len(messages) > 0
     
     def test_fallback_without_cartopy(self, plotter, sample_hourly_dataset, monkeypatch):
         """Test fallback dummy map when cartopy is not available."""
@@ -157,10 +163,11 @@ class TestMapPlotter:
             
             # This test mainly checks the fallback path exists
             # In real scenario, _generate_dummy_map would be called
-            filepath = plotter.cache_dir / "fallback_test.png"
-            plotter._generate_dummy_map("NO2", 16, filepath)
-            
-            assert filepath.exists()
+            result, messages = plotter._generate_dummy_map("NO2", 16)
+
+            assert result is not None
+            assert Path(result).exists()
+            assert isinstance(messages, list)
         finally:
             # Restore modules
             sys.modules.update(original_modules)
@@ -188,16 +195,19 @@ class TestMapPlotterEdgeCases:
             },
         )
         
-        result = plotter.generate_map(
+        result, messages = plotter.generate_map(
             dataset=ds,
             hour=16,
             variable="NO2",
             dataset_name="NaNTest",
             bbox=[-112.8, 40.0, -111.5, 41.5],
         )
-        
+
         # Should return None for empty data
         assert result is None
+        assert isinstance(messages, list)
+        # Should have a warning message about NaN data
+        assert len(messages) > 0
     
     def test_cache_directory_created(self, tmp_dir):
         """Test that cache directory is automatically created."""

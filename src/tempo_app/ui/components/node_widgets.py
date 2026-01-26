@@ -202,9 +202,17 @@ class NodeParamEditor(ft.AlertDialog):
         controls = []
         
         # Common parameters by node type
+        # Get available variables dynamically from registry
+        from ...core.variable_registry import VariableRegistry
+        available_vars = [v.output_var for v in VariableRegistry.discover_variables()]
+        # Add common derived variables
+        available_vars.extend(["FNR"])  # Add FNR if not already there
+        # Remove duplicates and sort
+        available_vars = sorted(set(available_vars))
+
         param_defs = {
             "select_variable": [
-                ("variable", "Variable", ["NO2_TropVCD", "HCHO_TotVCD", "FNR"]),
+                ("variable", "Variable", available_vars),
             ],
             "n_pixel_avg": [
                 ("n_pixels", "Number of Pixels", [1, 4, 9, 16]),

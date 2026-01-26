@@ -116,6 +116,12 @@ class DatasetCard(ft.Container):
                         size=11,
                         color=Colors.ON_SURFACE_VARIANT,
                     ),
+                    # Variables
+                    ft.Text(
+                        f"Variables: {ds.variables_str()}",
+                        size=11,
+                        color=Colors.ON_SURFACE_VARIANT,
+                    ),
                     # Size and status
                     ft.Row([
                         ft.Text(

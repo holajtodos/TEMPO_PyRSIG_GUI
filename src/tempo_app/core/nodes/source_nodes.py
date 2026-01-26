@@ -24,9 +24,14 @@ class SelectVariableNode(Node):
         """Extract variable data for all sites from the dataset."""
         ds = context.dataset
         sites = context.sites
-        
+
         if self.variable not in ds:
-            raise ValueError(f"Variable '{self.variable}' not found in dataset")
+            available = list(ds.data_vars.keys())
+            raise ValueError(
+                f"Variable '{self.variable}' not found.\n"
+                f"Available: {', '.join(available)}\n"
+                f"This dataset may not have included this variable."
+            )
         
         # Get coordinates
         lats = ds['LAT'].values

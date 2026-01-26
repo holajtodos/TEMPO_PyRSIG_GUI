@@ -11,9 +11,6 @@ from .ui.theme import create_dark_theme, create_light_theme, Colors, LightColors
 from .ui.shell import AppShell
 from .ui.pages.create import CreatePage
 from .ui.pages.library import LibraryPage
-from .ui.pages.inspect import InspectPage
-from .ui.pages.sites import SitesPage
-from .ui.pages.plot import PlotPage
 from .ui.pages.export import ExportPage
 from .ui.pages.workspace import WorkspacePage
 from .ui.pages.settings import SettingsPage
@@ -135,8 +132,6 @@ class App:
         elif base_route == "/workspace":
             # Workspace page - unified Map/Export/Sites view
             content = WorkspacePage(db=self.db, data_dir=self.data_dir, dataset_id=route_param)
-        elif base_route == "/sites":
-            content = SitesPage(db=self.db)
         elif base_route == "/settings":
             content = SettingsPage(
                 config=self.config,
@@ -147,13 +142,6 @@ class App:
             content = AIAnalysisPage(db=self.db, data_dir=self.data_dir)
         elif base_route == "/export":
             content = ExportPage(db=self.db, data_dir=self.data_dir, dataset_id=route_param)
-        # Legacy routes (keep for backward compatibility during transition)
-        elif route == "/create":
-            content = CreatePage(db=self.db, config=self.config)
-        elif route == "/plot":
-            content = PlotPage(db=self.db, data_dir=self.data_dir)
-        elif route == "/inspect":
-            content = InspectPage(db=self.db)
         else:
             content = self._create_page_placeholder("Unknown Page", "❓")
 

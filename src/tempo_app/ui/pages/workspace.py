@@ -98,18 +98,21 @@ class WorkspacePage(ft.Container):
             logging.error(f"Dataset not found: {dataset_id}")
 
     async def _load_available_hours(self):
-        """Load available hours from the dataset file and update slider."""
+        """Load available hours and variables from the dataset file and update UI."""
         import logging
         import pandas as pd
         try:
             if not self._dataset or not self._dataset.file_path:
                 return
-            
+
             processed_path = Path(self._dataset.file_path)
             if not processed_path.exists():
                 return
-                
+
             ds = await asyncio.to_thread(xr.open_dataset, processed_path)
+
+            # Populate variable dropdown with available variables from dataset
+            self._populate_variable_dropdown(ds)
             
             available_hours = []
             num_timesteps = 0
@@ -152,6 +155,52 @@ class WorkspacePage(ft.Container):
         except Exception as e:
             import logging
             logging.error(f"Failed to load available hours: {e}")
+
+    def _populate_variable_dropdown(self, ds: xr.Dataset):
+        """Populate variable dropdown with available variables from dataset."""
+        import logging
+        from ...core.variable_registry import VariableRegistry
+
+        # Get all data variables from the dataset (excluding coordinates)
+        available_vars = [var for var in ds.data_vars.keys()]
+
+        logging.info(f"Available variables in dataset: {available_vars}")
+
+        # Get metadata from registry for better display names
+        registry_vars = {v.output_var: v for v in VariableRegistry.discover_variables()}
+
+        # Build dropdown options
+        options = []
+        default_value = None
+
+        for var_name in sorted(available_vars):
+            # Get display name from registry if available
+            if var_name in registry_vars:
+                var_meta = registry_vars[var_name]
+                display_name = var_meta.display_name
+                if var_meta.unit:
+                    display_name += f" ({var_meta.unit})"
+            else:
+                # Fallback for variables not in registry (like FNR)
+                if var_name == 'FNR':
+                    display_name = "FNR (HCHO/NO₂ Ratio)"
+                else:
+                    display_name = var_name
+
+            options.append(ft.DropdownOption(key=var_name, text=display_name))
+
+            # Set default to FNR if available, otherwise first variable
+            if var_name == 'FNR' or default_value is None:
+                default_value = var_name
+
+        # Update dropdown
+        self._variable_dropdown.options = options
+        if default_value:
+            self._variable_dropdown.value = default_value
+        elif options:
+            self._variable_dropdown.value = options[0].key
+
+        logging.info(f"Populated variable dropdown with {len(options)} variables, default: {self._variable_dropdown.value}")
 
     def _on_dataset_change(self, e):
         """Handle dataset selection change."""
@@ -224,14 +273,12 @@ class WorkspacePage(ft.Container):
 
     def _build_map_section(self):
         """Build the map preview and controls section (left column)."""
-        # Variable selector - keys must match plotter expectations: 'NO2', 'HCHO', 'FNR'
+        # Variable selector - dynamically populated when dataset loads
         self._variable_dropdown = ft.Dropdown(
             label="Variable",
-            value="FNR",
+            value="",
             options=[
-                ft.DropdownOption(key="FNR", text="FNR (HCHO/NO2)"),
-                ft.DropdownOption(key="NO2", text="NO2 Tropospheric VCD"),
-                ft.DropdownOption(key="HCHO", text="HCHO Total VCD"),
+                # Will be populated from dataset when loaded
             ],
             width=200,
             border_color=Colors.BORDER,
@@ -239,6 +286,58 @@ class WorkspacePage(ft.Container):
             dense=True,
             text_style=ft.TextStyle(color=Colors.ON_SURFACE),
             label_style=ft.TextStyle(color=Colors.ON_SURFACE_VARIANT),
+        )
+
+        # Colormap selector
+        self._colormap_dropdown = ft.Dropdown(
+            label="Colormap",
+            value="auto",
+            options=[
+                ft.DropdownOption(key="auto", text="Auto (Default)"),
+                ft.DropdownOption(key="viridis", text="Viridis"),
+                ft.DropdownOption(key="plasma", text="Plasma"),
+                ft.DropdownOption(key="RdBu_r", text="Red-Blue"),
+                ft.DropdownOption(key="YlOrRd", text="Yellow-Orange-Red"),
+                ft.DropdownOption(key="coolwarm", text="Cool-Warm"),
+            ],
+            width=160,
+            border_color=Colors.BORDER,
+            bgcolor=Colors.SURFACE_VARIANT,
+            dense=True,
+            text_style=ft.TextStyle(color=Colors.ON_SURFACE),
+            label_style=ft.TextStyle(color=Colors.ON_SURFACE_VARIANT),
+        )
+
+        # Color scale range controls
+        self._vmin_field = ft.TextField(
+            label="Min",
+            hint_text="Auto",
+            width=80,
+            dense=True,
+            disabled=True,  # Start disabled since auto is checked by default
+            border_color=Colors.BORDER,
+            bgcolor=Colors.SURFACE_VARIANT,
+            text_style=ft.TextStyle(color=Colors.ON_SURFACE),
+            label_style=ft.TextStyle(color=Colors.ON_SURFACE_VARIANT, size=11),
+        )
+
+        self._vmax_field = ft.TextField(
+            label="Max",
+            hint_text="Auto",
+            width=80,
+            dense=True,
+            disabled=True,  # Start disabled since auto is checked by default
+            border_color=Colors.BORDER,
+            bgcolor=Colors.SURFACE_VARIANT,
+            text_style=ft.TextStyle(color=Colors.ON_SURFACE),
+            label_style=ft.TextStyle(color=Colors.ON_SURFACE_VARIANT, size=11),
+        )
+
+        self._auto_scale_checkbox = ft.Checkbox(
+            label="Auto",
+            value=True,
+            label_style=ft.TextStyle(color=Colors.ON_SURFACE, size=12),
+            on_change=self._on_auto_scale_change,
         )
 
         # Road options
@@ -303,12 +402,37 @@ class WorkspacePage(ft.Container):
 
         self._progress_bar = ft.ProgressBar(visible=False, color=Colors.PRIMARY)
 
-        # Status log (shared for map and export)
+        # Status message display (for errors/warnings)
+        self._status_icon = ft.Icon(ft.Icons.INFO_OUTLINE, color=Colors.PRIMARY, size=20)
+        self._status_text = ft.Text(
+            "",
+            size=13,
+            color=Colors.ON_SURFACE,
+            expand=True,
+        )
+        self._status_container = ft.Container(
+            content=ft.Row([
+                self._status_icon,
+                self._status_text,
+            ], spacing=8),
+            padding=8,
+            border_radius=6,
+            bgcolor=Colors.SURFACE_VARIANT,
+            visible=False,  # Hidden by default
+        )
 
-
-        # Controls row
-        controls_row = ft.Row([
+        # Controls row - split into two rows for better layout
+        controls_row_1 = ft.Row([
             self._variable_dropdown,
+            self._colormap_dropdown,
+            ft.Text("Range:", size=12, color=Colors.ON_SURFACE_VARIANT),
+            self._vmin_field,
+            ft.Text("-", size=12, color=Colors.ON_SURFACE_VARIANT),
+            self._vmax_field,
+            self._auto_scale_checkbox,
+        ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8)
+
+        controls_row_2 = ft.Row([
             self._road_dropdown,
             self._show_sites_checkbox,
             ft.Container(expand=True),
@@ -337,11 +461,14 @@ class WorkspacePage(ft.Container):
         )
 
         return ft.Column([
-            controls_row,
+            controls_row_1,
+            ft.Container(height=4),
+            controls_row_2,
             ft.Container(height=4),
             hour_row,
             self._progress_bar,
             ft.Container(height=4),
+            self._status_container,  # Status messages display
             map_container,
         ], expand=True, spacing=0)
 
@@ -461,11 +588,49 @@ class WorkspacePage(ft.Container):
             if shell and hasattr(shell, 'navigate_to'):
                 shell.navigate_to("/sites")
 
+    def _show_status_message(self, message: str, is_error: bool = False, is_warning: bool = False):
+        """Show a status message with appropriate styling."""
+        self._status_text.value = message
+        self._status_container.visible = True
+
+        if is_error:
+            self._status_container.bgcolor = Colors.ERROR_CONTAINER
+            self._status_text.color = Colors.ON_ERROR_CONTAINER
+            self._status_icon.name = ft.Icons.ERROR_OUTLINE
+            self._status_icon.color = Colors.ERROR
+        elif is_warning:
+            self._status_container.bgcolor = "#FFF3E0"  # Light orange
+            self._status_text.color = "#E65100"  # Dark orange
+            self._status_icon.name = ft.Icons.WARNING_OUTLINE
+            self._status_icon.color = "#FF9800"  # Orange
+        else:
+            self._status_container.bgcolor = Colors.PRIMARY_CONTAINER
+            self._status_text.color = Colors.ON_PRIMARY_CONTAINER
+            self._status_icon.name = ft.Icons.INFO_OUTLINE
+            self._status_icon.color = Colors.PRIMARY
+
+        self.update()
+
+    def _hide_status_message(self):
+        """Hide the status message."""
+        self._status_container.visible = False
+        self.update()
+
     def _on_hour_change(self, e):
         """Handle hour slider change."""
         hour = int(e.control.value)
         self._current_hour = hour
         self._hour_text.value = f"Hour: {hour} UTC"
+        self.update()
+
+    def _on_auto_scale_change(self, e):
+        """Handle auto scale checkbox change - enable/disable min/max fields."""
+        auto_enabled = self._auto_scale_checkbox.value
+        self._vmin_field.disabled = auto_enabled
+        self._vmax_field.disabled = auto_enabled
+        if auto_enabled:
+            self._vmin_field.value = ""
+            self._vmax_field.value = ""
         self.update()
 
     def _on_show_sites_change(self, e):
@@ -516,10 +681,27 @@ class WorkspacePage(ft.Container):
             variable = self._variable_dropdown.value
             road_detail = self._road_dropdown.value
             hour = self._current_hour
-            
-            logging.info(f"Calling plotter.generate_map(variable={variable}, hour={hour})")
 
-            plot_path = await asyncio.to_thread(
+            # Get colormap settings
+            colormap_value = self._colormap_dropdown.value
+            colormap = None if colormap_value == "auto" else colormap_value
+
+            # Get vmin/vmax settings
+            vmin = None
+            vmax = None
+            if not self._auto_scale_checkbox.value:
+                try:
+                    if self._vmin_field.value:
+                        vmin = float(self._vmin_field.value)
+                    if self._vmax_field.value:
+                        vmax = float(self._vmax_field.value)
+                except ValueError:
+                    logging.warning("Invalid min/max values, using auto scale")
+
+            logging.info(f"Calling plotter.generate_map(variable={variable}, hour={hour}, colormap={colormap}, vmin={vmin}, vmax={vmax})")
+
+            # Generate map - now returns (result, messages)
+            plot_path, messages = await asyncio.to_thread(
                 self.plotter.generate_map,
                 ds,
                 hour,
@@ -528,11 +710,22 @@ class WorkspacePage(ft.Container):
                 self._dataset.bbox.to_list(),
                 road_detail,
                 sites,
+                colormap=colormap,
+                vmin=vmin,
+                vmax=vmax,
             )
 
             ds.close()
-            
-            logging.info(f"Plotter returned: {plot_path}")
+
+            # Log any messages from the plotter
+            for msg in messages:
+                if "❌" in msg or "ERROR" in msg:
+                    logging.error(msg)
+                elif "⚠️" in msg or "WARNING" in msg:
+                    logging.warning(msg)
+                else:
+                    logging.info(msg)
+
             logging.info(f"Plotter returned: {plot_path}")
 
             if plot_path:
@@ -540,12 +733,30 @@ class WorkspacePage(ft.Container):
                     self._map_image.src = plot_path
                     self._map_image.visible = True
                     self._map_placeholder.visible = False
-                    logging.info(f"Map generated: {variable} at {hour}:00 UTC")
+
+                    # Display messages in UI and logs
+                    if messages:
+                        warnings_text = "\n".join(messages)
+                        self._show_status_message(
+                            f"✅ Map generated for {hour:02d}:00 UTC\n{warnings_text}",
+                            is_warning=True
+                        )
+                        logging.info(f"Map generated: {variable} at {hour}:00 UTC (with warnings: {'; '.join(messages)})")
+                    else:
+                        self._hide_status_message()
+                        logging.info(f"Map generated: {variable} at {hour}:00 UTC")
                     logging.info(f"Map image set to: {plot_path}")
                 else:
                     logging.error(f"Plot path doesn't exist: {plot_path}")
+                    self._show_status_message(f"❌ Error: Plot file not found", is_error=True)
             else:
-                logging.error(f"No map returned for hour {hour}")
+                error_msg = f"No map returned for hour {hour}"
+                if messages:
+                    error_msg = "\n".join(messages)
+                    self._show_status_message(error_msg, is_error=True)
+                else:
+                    self._show_status_message(f"❌ No map returned for hour {hour}", is_error=True)
+                logging.error(error_msg)
 
         except Exception as ex:
             import traceback
