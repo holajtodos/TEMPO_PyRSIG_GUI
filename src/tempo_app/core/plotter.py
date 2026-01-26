@@ -180,23 +180,26 @@ class MapPlotter:
                 label = variable
                 default_cmap = 'viridis'
 
+            # Special handling for FNR variable - apply defaults independent of colormap
+            if variable == 'FNR':
+                label = 'FNR (HCHO/NO2)'
+                # Filter positive values only
+                data = data.where(data > 0)
+                # Default FNR range (only if not explicitly set by user)
+                if vmin is None:
+                    vmin = 2
+                if vmax is None:
+                    vmax = 8
+
             # Apply colormap override if specified, otherwise use default
             if colormap:
                 cmap = colormap
             else:
-                # Special handling for common variables
+                # Use variable-specific default colormap
                 if variable == 'FNR':
                     # Blue-Grey-Red colormap for FNR
                     colors = [(0.3, 0.5, 1), 'silver', (1, 0.4, 0.4)]
                     cmap = LinearSegmentedColormap.from_list('bgr', colors, N=256)
-                    label = 'FNR (HCHO/NO2)'
-                    # Filter positive values only
-                    data = data.where(data > 0)
-                    # Default FNR range
-                    if vmin is None:
-                        vmin = 2
-                    if vmax is None:
-                        vmax = 8
                 else:
                     cmap = default_cmap
 
